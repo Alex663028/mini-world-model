@@ -54,6 +54,74 @@ TOOL_ASKS = {
 TOOL_TRAJ = []
 
 
+# ---------------- 参数化工具调用（两项目融合：离散工具 + 连续动作参数）----------------
+PARAM_ASKS = [
+    ("往西北走一点", "world_act", {"direction": "西北"}, "朝西北推了一把，位置往前挪了一截。"),
+    ("朝左边推一下", "world_act", {"direction": "西"}, "往西推了一把。"),
+    ("向右走走", "world_act", {"direction": "东"}, "往东推了一把。"),
+    ("往南走两步", "world_act", {"direction": "南"}, "往南推了一把，离目标近了些。"),
+    ("朝东北方向走", "world_act", {"direction": "东北"}, "朝东北推了一把。"),
+    ("想象 24 步会怎样", "world_imagine", {"steps": 24}, "我预演了 24 步，梦里会挪得不近但方向没错。"),
+    ("想象 8 步看看", "world_imagine", {"steps": 8}, "8 步的想象比较准，短程预测误差小。"),
+    ("往西北走，轻一点", "world_act", {"direction": "西北", "magnitude": 0.4}, "轻轻往西北推了一把。"),
+]
+
+
+def _param_trajs():
+    """参数化工具调用轨迹：教模型输出带动作参数的调用（融合点）。
+
+    扩量说明：初版只有 8 条（占数据集 0.2%），模型学会了格式但参数常选错
+    （问"朝左边"却调 direction=东北）。每个方向 × 多问法扩到 ~90 条。
+    """
+    dirs = ["东", "西", "南", "北", "东北", "东南", "西北", "西南"]
+    asks = {
+        "东": ["往东走", "朝东走一步", "往东边挪挪", "向东推一下"],
+        "西": ["往西走", "朝西走一步", "往西边挪挪", "向西推一下"],
+        "南": ["往南走", "朝南走一步", "往下走", "向南推一下"],
+        "北": ["往北走", "朝北走一步", "往上走", "向北推一下"],
+        "东北": ["往东北走", "朝东北走一步", "往东北方向挪"],
+        "东南": ["往东南走", "朝东南走一步", "往东南方向挪"],
+        "西北": ["往西北走", "朝西北走一步", "往西北方向挪", "往西北走一点"],
+        "西南": ["往西南走", "朝西南走一步", "往西南方向挪"],
+    }
+    out = []
+    for d in dirs:
+        for ask in asks[d]:
+            out.append([
+                {"role": "user", "content": ask},
+                {"role": "assistant", "content": "",
+                 "tool_calls": json.dumps(
+                     [{"name": "world_act", "arguments": {"direction": d}}], ensure_ascii=False)},
+                {"role": "tool", "content": f"朝{d}推了一把，位置变了。"},
+                {"role": "assistant", "content": f"朝{d}推了一把。"},
+            ])
+    # 幅度参数（轻一点/用力一点）
+    for d in ["西北", "东", "南"]:
+        for mag, word in [(0.4, "轻一点"), (0.9, "用力一点")]:
+            ask = f"往{d}走，{word}"
+            out.append([
+                {"role": "user", "content": ask},
+                {"role": "assistant", "content": "",
+                 "tool_calls": json.dumps(
+                     [{"name": "world_act", "arguments": {"direction": d, "magnitude": mag}}],
+                     ensure_ascii=False)},
+                {"role": "tool", "content": f"朝{d}推了一把（幅度 {mag}）。"},
+                {"role": "assistant", "content": f"朝{d}推了一把，幅度 {mag}。"},
+            ])
+    # 想象步数参数
+    for steps in [8, 12, 20, 24]:
+        ask = f"想象 {steps} 步会怎样"
+        out.append([
+            {"role": "user", "content": ask},
+            {"role": "assistant", "content": "",
+             "tool_calls": json.dumps(
+                 [{"name": "world_imagine", "arguments": {"steps": steps}}], ensure_ascii=False)},
+            {"role": "tool", "content": f"{steps} 步想象：梦里我挪了一截，方向没错。"},
+            {"role": "assistant", "content": f"{steps} 步的想象完成，梦里位置大致对得上。"},
+        ])
+    return out
+
+
 def _tool_trajs():
     """工具调用轨迹：user → assistant(tool_calls) → tool(result) → assistant(答案)。
 
@@ -208,7 +276,7 @@ def build():
     """产出 SFT JSONL。每条 {"conversations": [...]}。"""
     _tool_trajs()
     samples = []
-    for conv in _dialogs() + _knowledge() + TOOL_TRAJ:
+    for conv in _dialogs() + _knowledge() + TOOL_TRAJ + _param_trajs():
         samples.append({"conversations": [{"role": "system", "content": SYSTEM}] + conv})
     return samples
 

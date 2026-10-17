@@ -72,8 +72,14 @@ class SFTDataset(Dataset):
                     calls = m["tool_calls"]
                     if isinstance(calls, str):
                         calls = json.loads(calls)
-                    names = "，".join(c.get("name", "") for c in calls)
-                    content = "[调用工具 " + names + "]" + content
+                    # 带参数的工具调用（两项目融合点）：
+                    # [调用工具 world_act, direction=西北]
+                    parts = []
+                    for c in calls:
+                        args = c.get("arguments") or {}
+                        arg_str = ", ".join(f"{k}={v}" for k, v in args.items())
+                        parts.append(c.get("name", "") + (f", {arg_str}" if arg_str else ""))
+                    content = "[调用工具 " + "，".join(parts) + "]" + content
                 add(content, True)  # 只有回答内容学
                 add("\n", True)
             if len(ids) >= block:

@@ -97,6 +97,61 @@ LATENT_KEYS = ["潜状态", "latent", "编码", "表征"]
 DIR8 = ["正东", "东北", "正北", "西北", "正西", "西南", "正南", "东南"]
 
 
+# ==================== 世界状态与事件演化 ====================
+
+class WorldState:
+    """agent 维护的显式世界状态（LingBot-World 2.0 的核心思想移植）。
+
+    世界模型不只预测像素，还要维护"世界处于什么状态、发生过什么"。
+    这里记录 agent 自己的世界副本：位置、速度、目标、距离，
+    以及事件流（到达 / 撞墙 / 失败 / 超时 / 单步动作）。
+
+    为什么要显式化：原实现里状态散落在 env 的真值里，语言模型
+    无从知道"我刚才撞过墙"，只能靠当次画面回答。有了事件流，
+    agent 能回答"你刚才经历了什么"——这就是"记忆"和"反应"的区别。
+    """
+
+    def __init__(self):
+        self.events = []          # 事件流（最多保留 12 条）
+        self.wall_hits = 0
+        self.arrivals = 0
+        self.failures = 0
+        self.total_steps = 0
+
+    def add(self, kind, text, step=None):
+        self.events.append({"kind": kind, "text": text, "step": step})
+        if len(self.events) > 12:
+            del self.events[0]
+        if kind == "arrive":
+            self.arrivals += 1
+        elif kind == "wall":
+            self.wall_hits += 1
+        elif kind in ("fail", "timeout"):
+            self.failures += 1
+
+    def summary(self):
+        if not self.events:
+            return "我还没做过什么事，世界是初始状态。"
+        last = self.events[-1]
+        return (f"最近一次是{last['text']}。整体上：我到过目标 {self.arrivals} 次，"
+                f"撞墙 {self.wall_hits} 次，失败 {self.failures} 次，"
+                f"累计走了 {self.total_steps} 步。")
+
+    def detail(self):
+        if not self.events:
+            return "还没有任何事件记录。"
+        lines = [f"{i + 1}. {e['text']}" for i, e in enumerate(self.events[-6:])]
+        return "；".join(lines)
+
+    def reset(self):
+        self.events = []
+        self.wall_hits = self.arrivals = self.failures = self.total_steps = 0
+
+
+EVENT_Q = ["刚才发生了什么", "你刚才做了什么", "你经历了什么", "碰到什么问题了",
+           "你撞墙了吗", "刚才顺利吗", "发生了什么", "你都干了什么"]
+
+
 class MiniWorldAgent:
     def __init__(self, world_ckpt="checkpoint.pt", lm_ckpt="lm_state.pt",
                  dialog_ckpt="lm_unified.pt", seed=None, config=None):
@@ -150,7 +205,41 @@ class MiniWorldAgent:
         self.last_z = None  # 上一帧潜状态（运动感知 Δz 用）
         self.http_tools = {}  # 远程 HTTP 工具注册表
         self._prev_a = np.zeros(2, dtype=np.float32)  # 上一个动作（惯性候选用）
+        self.state = WorldState()   # 显式世界状态 + 事件流
         self._lock = threading.Lock()
+
+    def _step_env(self, action):
+        """执行一步环境推进，同时记录事件（撞墙检测 / 到达 / 失败）。
+
+        撞墙判定：环境物理是 v' = 0.8v + 0.12a、pos' = pos + v' * 0.10，
+所以无墙预期位置是 pos + (0.8v + 0.12a) * 0.10；
+实际位置明显偏离时判为撞墙。
+（两次公式错误都踩过：漏 0.8 衰减、漏 0.10 位移系数——
+  结果 36 步误报 21 次撞墙。指标算错就别信）
+        """
+        expected = self.env.pos + (0.8 * self.env.vel + 0.12 * action) * 0.10
+        obs, _, done, info = self.env.step(action)
+        self.state.total_steps += 1
+        dev = float(np.linalg.norm(self.env.pos - expected))
+        if dev > 0.25:      # 反弹导致位置明显偏离预期
+            self.state.add("wall", "撞墙了，反弹回来",
+                            step=self.env.steps)
+        if done and info.get("reached"):
+            self.state.add("arrive", f"到达目标了（用了 {self.env.steps} 步）",
+                            step=self.env.steps)
+        return obs, 0.0, done, info
+
+    def _events_answer(self, text):
+        """事件记忆回答（agent 知道自己经历过什么）。"""
+        if any(q in text for q in ("撞墙", "碰到墙")):
+            if self.state.wall_hits:
+                return f"撞过，一共 {self.state.wall_hits} 次。每次反弹回来我就换方向再试。"
+            return "还没撞过墙。一直走得挺顺。"
+        if "顺利" in text:
+            ok = self.state.arrivals
+            return (f"到目前为止到过目标 {ok} 次，撞墙 {self.state.wall_hits} 次，"
+                    f"失败 {self.state.failures} 次。{'总体还算顺利。' if ok else '还没成功到过。'}")
+        return self.state.summary() + "细节：" + self.state.detail()
 
     def _load_lm(self, path):
         """加载一个 TinyGPT checkpoint，返回 (model, stoi, itos, config) 或 None。"""
@@ -235,20 +324,36 @@ class MiniWorldAgent:
             )
         return "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):].strip()
 
-    def execute_tool(self, name, question=""):
+    def execute_tool(self, name, question="", **kwargs):
         """执行工具调用——agentic 模式与路由模式共用同一套工具实现。
 
         优先查远程 HTTP 工具（跨进程能力），没有再走本地工具。
+        参数化调用（方向/幅度/步数）在这里翻译成连续控制动作——
+        这正是两项目的融合点：MiniMind 的 Tool Call 决定"调哪个"，
+        LingBot-World 的 action-conditioned 决定"带什么动作参数"。
         """
         if name in getattr(self, "http_tools", {}):
             return self._call_http_tool(name, question)
+        direction = kwargs.get("direction")
+        if name == "world_navigate":
+            if isinstance(direction, str):
+                return self._act_direction(direction, kwargs.get("magnitude", 0.7))
+            return self._run_navigation()
         if name == "world_perceive":
             return self.reply("你看到了什么？")
-        if name == "world_navigate":
-            return self._run_navigation()
         if name == "world_imagine":
-            return self._imagine("想象一下往左走")
+            steps = kwargs.get("steps")
+            old = self.cfg.get("imagine_horizon")
+            if steps:
+                self.cfg["imagine_horizon"] = max(4, min(40, int(steps)))
+            try:
+                return self._imagine("想象一下往左走")
+            finally:
+                if steps and old:
+                    self.cfg["imagine_horizon"] = old
         if name == "world_act":
+            if isinstance(direction, str):
+                return self._act_direction(direction, kwargs.get("magnitude", 0.7))
             return self._act("往前走")
         if name == "kb_query":
             hit = self._retrieve(question)
@@ -257,14 +362,53 @@ class MiniWorldAgent:
             return self._try_calc(question) or "算式没解析出来"
         return f"未知工具 {name}"
 
+    def _act_direction(self, direction, magnitude=0.7):
+        """按中文方向执行一步动作（参数化调用的落地）。"""
+        table = {
+            "北": (0, -1), "东北": (1, -1), "东": (1, 0), "东南": (1, 1),
+            "南": (0, 1), "西南": (-1, 1), "西": (-1, 0), "西北": (-1, -1),
+            "上": (0, -1), "下": (0, 1), "左": (-1, 0), "右": (1, 0),
+            "前": (0, -1), "后": (0, 1),
+        }
+        vec = None
+        for key in sorted(table, key=len, reverse=True):
+            if key in direction:
+                vec = table[key]
+                break
+        if vec is None:
+            return f"听不懂方向「{direction}」，试试东南西北。"
+        a = np.array([vec[0], vec[1]], dtype=np.float32)
+        n = float(np.linalg.norm(a))
+        if n > 0:
+            a = a / n * float(np.clip(magnitude, 0.1, 1.0))
+        obs, _, done, info = self._step_env(a)
+        return (f"朝{direction}推了一把，现在在 ({self.env.pos[0]:.2f}, "
+                f"{self.env.pos[1]:.2f})，离目标 {info['dist']:.2f}。")
+
     @staticmethod
     def _parse_tool(text):
-        """从生成文本里解析 [调用工具 name]。"""
+        """解析工具调用，支持带参数的形式（两项目融合点）。
+
+        两种格式：
+          [调用工具 world_navigate]
+          [调用工具 world_navigate, direction=西北, magnitude=0.7]
+        """
         if "[调用工具" not in text:
-            return None, ""
+            return None, {}, ""
         body = text.split("[调用工具", 1)[1]
-        name = body.split("]")[0].strip()
-        return name, text.split("]", 1)[1] if "]" in text else ""
+        call = body.split("]", 1)[0] if "]" in body else body
+        parts = [p.strip() for p in call.split(",") if p.strip()]
+        name = parts[0].strip()
+        kwargs = {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                v = v.strip().strip("'\"")
+                try:
+                    kwargs[k.strip()] = float(v)
+                except ValueError:
+                    kwargs[k.strip()] = v
+        return name, kwargs, ""
 
     def reply_agentic(self, text, max_rounds=3):
         """模型驱动的工具调用循环（MiniMind Agentic 模式）。
@@ -280,10 +424,10 @@ class MiniWorldAgent:
             gen = self._sft_generate(prompt)
             if not gen:
                 break
-            tool, _ = self._parse_tool(gen)
+            tool, kwargs, _ = self._parse_tool(gen)
             if not tool:
                 return gen
-            result = self.execute_tool(tool, text)
+            result = self.execute_tool(tool, text, **kwargs)
             prompt += f"{gen}\n结果：{result}\n助手："
         return self._sft_generate(prompt)
 
@@ -319,6 +463,10 @@ class MiniWorldAgent:
         # 3. 感知类 → 潜状态注入生成
         if self.lm is not None and self.state_dim > 0 and any(k in text for k in PERCEPTION_KEYS):
             return self._perception_answer(text)
+
+        # 3.5 事件记忆（agent 知道自己经历过什么）
+        if any(k in text for k in EVENT_Q):
+            return self._events_answer(text)
 
         # 4. 想象 / 单步动作 / 潜状态统计 → 世界模型工具查询
         if any(k in text for k in IMAGINE_KEYS):
@@ -629,7 +777,7 @@ class MiniWorldAgent:
                         phase = "approach"
                         switches += 1
 
-                obs, _, done, info = self.env.step(best_a)
+                obs, _, done, info = self._step_env(best_a)
                 prev_a = self._prev_a = best_a
                 steps_used = step + 1
                 stuck = stuck + 1 if info["dist"] >= d0 - 0.01 else 0
@@ -642,8 +790,13 @@ class MiniWorldAgent:
         if info.get("reached"):
             tail = f"过程：{'；'.join(reports)}。" if reports else ""
             note = f"中途切换控制层 {switches} 次。" if switches else ""
+            if self.state.wall_hits:
+                note += f"撞墙 {self.state.wall_hits} 次。"
             return f"任务完成！用 {steps_used} 步到达目标。{note}{tail}"
         tail = f"过程：{'；'.join(reports)}。" if reports else ""
+        if steps_used >= cfg["task_budget"]:
+            self.state.add("fail", f"走了 {steps_used} 步没到达，最近只剩 {info['dist']:.1f}",
+                            step=steps_used)
         return f"{steps_used} 步未能到达，最近时只剩 {info['dist']:.1f}。{tail}"
 
     @staticmethod
@@ -674,7 +827,7 @@ class MiniWorldAgent:
             d = self.env.target - self.env.pos
             n = np.linalg.norm(d)
             a = (d / n * 0.7).astype(np.float32) if n > 1e-6 else np.zeros(2, dtype=np.float32)
-        obs, _, done, info = self.env.step(a)
+        obs, _, done, info = self._step_env(a)
         tail = " 我到达目标了！" if info["reached"] else ""
         return (
             f"执行了动作 ({a[0]:.1f}, {a[1]:.1f})，现在在 "
@@ -728,6 +881,7 @@ class MiniWorldAgent:
 
     def _do_reset(self):
         self.env.reset()
+        self.state.reset()
         self.last_z = None  # 清空运动记忆（新回合）
         return (
             f"新回合开始。我在 ({self.env.pos[0]:.2f}, {self.env.pos[1]:.2f})，"
