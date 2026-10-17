@@ -36,6 +36,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from chat import bigrams, extract_agent_pos
+from corpus_dialog import (BOUND_Q, BYE, BYE_Q, CAN, CAN_Q, FAIL_Q, GREET, GREET_Q,
+                           NO, NO_Q, TASK_Q, TASK_READY, THANKS, THANKS_Q,
+                           WHO, WHO_Q, YES, YES_Q)
 from env import PointMassEnv
 from knowledge import ALL_KNOWLEDGE
 from model import MiniWorldModel
@@ -91,8 +94,8 @@ DIR8 = ["正东", "东北", "正北", "西北", "正西", "西南", "正南", "�
 
 
 class MiniWorldAgent:
-    def __init__(self, world_ckpt="checkpoint.pt", lm_ckpt="lm_state.pt", seed=None,
-                 config=None):
+    def __init__(self, world_ckpt="checkpoint.pt", lm_ckpt="lm_state.pt",
+                 dialog_ckpt="lm_dialog.pt", seed=None, config=None):
         cfg = dict(CONFIG)
         if config:
             cfg.update(config)
@@ -111,30 +114,23 @@ class MiniWorldAgent:
         self.env = PointMassEnv(seed=seed)
         self.env.reset()
 
-        # ---- 语言层：TinyGPT（可能带 L2 状态注入）----
-        self.lm = None
-        self.state_dim = 0
-        self.state_token_id = None
-        if os.path.exists(lm_ckpt):
-            try:
-                ck = torch.load(lm_ckpt, map_location=self.device)
-                lm_cfg = ck["config"]
-                self.state_dim = lm_cfg.get("state_dim", 0)
-                self.state_token_id = lm_cfg.get("state_token_id")
-                self.dz_scale = lm_cfg.get("dz_scale", 1.0)  # Δz 缩放（与训练数据一致）
-                self.lm = TinyGPT(
-                    vocab_size=len(ck["stoi"]),
-                    d_model=lm_cfg["d_model"], n_heads=lm_cfg["n_heads"],
-                    n_layers=lm_cfg["n_layers"], block_size=lm_cfg["block_size"],
-                    state_dim=self.state_dim, state_token_id=self.state_token_id,
-                )
-                self.lm.load_state_dict(ck["model"])
-                self.lm.to(self.device)  # 同上：显式移动模型本体
-                self.lm.eval()
-                self.stoi, self.itos = ck["stoi"], ck["itos"]
-            except Exception as e:
-                sys.stderr.write(f"[agent] LM load failed ({e}), running without LM\n")
-                self.lm = None
+        # ---- 语言层：双模型分工 ----
+        # lm = 具身感知模型（潜状态注入，回答"你在哪/看到什么"）
+        # lm_dialog = 对话模型（闲聊/自述/能力介绍，从高质量对话语料专精）
+        # 分工的依据：一个模型干两件事两头都不灵——实测单模型要么感知好但闲聊崩，
+        # 要么闲聊好但感知退化为百科幻觉
+        loaded = self._load_lm(lm_ckpt)
+        if loaded:
+            self.lm, self.stoi, self.itos, lm_cfg = loaded
+            self.state_dim = lm_cfg.get("state_dim", 0)
+            self.state_token_id = lm_cfg.get("state_token_id")
+            self.dz_scale = lm_cfg.get("dz_scale", 1.0)
+        else:
+            self.lm, self.state_dim, self.state_token_id = None, 0, None
+        dlg = self._load_lm(dialog_ckpt)
+        self.lm_dialog = dlg[0] if dlg else None
+        self.lm_dialog_stoi = dlg[1] if dlg else None
+        self.lm_dialog_itos = dlg[2] if dlg else None
 
         # ---- 常识检索索引（大库 + 小库全量打通）----
         self.kb = []
@@ -149,6 +145,27 @@ class MiniWorldAgent:
         self.history = []
         self.last_z = None  # 上一帧潜状态（运动感知 Δz 用）
         self._lock = threading.Lock()
+
+    def _load_lm(self, path):
+        """加载一个 TinyGPT checkpoint，返回 (model, stoi, itos, config) 或 None。"""
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            ck = torch.load(path, map_location=self.device)
+            c = ck["config"]
+            model = TinyGPT(
+                vocab_size=len(ck["stoi"]),
+                d_model=c["d_model"], n_heads=c["n_heads"],
+                n_layers=c["n_layers"], block_size=c["block_size"],
+                state_dim=c.get("state_dim", 0), state_token_id=c.get("state_token_id"),
+            )
+            model.load_state_dict(ck["model"])
+            model.to(self.device)  # 同上：显式移动模型本体
+            model.eval()
+            return model, ck["stoi"], ck["itos"], c
+        except Exception as e:
+            sys.stderr.write(f"[agent] LM load failed ({path}: {e})\n")
+            return None
 
     # ==================== 主入口：统一路由 ====================
 
@@ -241,6 +258,28 @@ class MiniWorldAgent:
         return torch.tensor([[self.stoi[c] for c in s if c in self.stoi]], dtype=torch.long,
                             device=self.device)
 
+    def _generate_dialog(self, question, max_tokens=80, temperature=None, top_k=None):
+        """对话模型生成（闲聊兜底）。专用对话模型：见过 385 条高质量对话语料，
+        输出是"对话模式"而非"百科模式"。"""
+        if self.lm_dialog is None:
+            return ""
+        cfg = self.cfg
+        temperature = cfg["temperature"] if temperature is None else temperature
+        top_k = top_k or cfg["top_k"]
+        prompt = f"问：{question}{PROMPT_END}"
+        idx = torch.tensor(
+            [[self.lm_dialog_stoi[c] for c in prompt if c in self.lm_dialog_stoi]],
+            dtype=torch.long, device=self.device,
+        )
+        stop_ids = {self.lm_dialog_stoi[c] for c in "\n" if c in self.lm_dialog_stoi}
+        with torch.no_grad():
+            out = self.lm_dialog.generate(
+                idx, max_new_tokens=max_tokens, temperature=temperature,
+                top_k=top_k, stop_ids=stop_ids,
+            )
+        gen = "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):]
+        return gen.strip().rstrip("问：答").strip("： ")
+
     def _generate(self, question, state=None, max_tokens=None, temperature=None, top_k=None):
         """语言模型生成；state 非空时插入 [STATE] token 并注入潜状态。
 
@@ -295,20 +334,51 @@ class MiniWorldAgent:
             return best["answer"], best_score
         return None
 
-    def _chat_answer(self, question):
-        """常识/闲聊：检索优先，生成兜底。
+    def _system_answer(self, text):
+        """系统自述精确回答：从对话语料结构化数据查表，零幻觉、可控。
 
-        高置信检索命中 → 直接给权威答案（不附生成补充——
-        生成的幻觉内容是噪声，不是价值）
-        检索未命中 → 语言模型生成；生成也失败 → 诚实说不知道
+        为什么要这层：对话模型专精"问什么答什么"后，对身份/能力类问题
+        会稳定地自报家门（语料里这类占 40%），但对"谢谢你"也报家门就串了。
+        这类问题本质是固定知识，直接查表比生成可靠。
+
+        匹配策略：所有问法合并成一张表、按长度降序——
+        避免短问法劫持长问法（"你会什么" 抢走 "你会什么语言"）。
         """
+        t = text.rstrip("？?。.!！")
+        table = []
+        for q_list, a_list in [
+            (WHO_Q, WHO), (CAN_Q, CAN), (GREET_Q, GREET),
+            (THANKS_Q, THANKS), (BYE_Q, BYE), (YES_Q, YES), (NO_Q, NO),
+            (TASK_Q, TASK_READY),
+        ]:
+            table.extend((q, a_list) for q in q_list)
+        table.extend((q, [a]) for q, a in BOUND_Q + FAIL_Q)
+        table.sort(key=lambda x: -len(x[0]))
+        for q, a_list in table:
+            if t == q or (len(q) >= 3 and q in text):
+                return a_list[len(text) % len(a_list)]
+        return None
+
+    def _chat_answer(self, question):
+        """常识/闲聊：四层兜底——系统查表 → 知识检索 → 对话生成 → 诚实说不知道。"""
+        # 1. 系统自述/能力/礼貌（精确，零幻觉）
+        sys_ans = self._system_answer(question)
+        if sys_ans:
+            return sys_ans
+        # 2. 常识库检索
         hit = self._retrieve(question, threshold=self.cfg["kb_threshold"])
         if hit:
             return hit[0]
-        if self.lm is None:
-            return "我的语言模块没加载，常识检索也没命中。换个问法试试？"
-        gen = self._generate(question)
-        return gen if gen else "我没组织好语言，检索也没命中。换个问法试试？"
+        # 3. 对话模型生成（闲聊兜底）
+        if self.lm_dialog is not None:
+            gen = self._generate_dialog(question)
+            if gen:
+                return gen
+        if self.lm is not None:
+            gen = self._generate(question)
+            if gen:
+                return gen
+        return "这个我答不上来。我的常识库有六百多条，但这条不在里面。"
 
     # ==================== 符号层 ====================
 

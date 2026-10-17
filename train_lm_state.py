@@ -54,8 +54,8 @@ def build_state_samples(path, stoi):
     return xs, ys, states
 
 
-def build_plain_samples(path, stoi, char_budget, state_dim):
-    """普通语料：切窗样本，state 填零。"""
+def build_plain_samples(path, stoi, char_budget, state_dim, repeat=1):
+    """普通语料：切窗样本，state 填零。repeat 用于小语料扩量（对话语料需要）。"""
     if not os.path.exists(path):
         return [], [], []
     with open(path, "r", encoding="utf-8") as f:
@@ -68,7 +68,7 @@ def build_plain_samples(path, stoi, char_budget, state_dim):
         n += len(line)
         if n >= char_budget:
             break
-    text = "".join(text)
+    text = "".join(text) * repeat
     data = [stoi[c] for c in text if c in stoi]
     n_win = max(1, (len(data) - 1) // BLOCK)
     xs = [data[i * BLOCK : i * BLOCK + BLOCK][:-1] for i in range(n_win)]
@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--state-data", type=str, default="state_qa_motion.jsonl")
     parser.add_argument("--plain-corpus", type=str, default="corpus_final.txt")
     parser.add_argument("--plain-budget", type=float, default=2.7, help="普通语料字符预算（百万）")
+    parser.add_argument("--repeat", type=int, default=1, help="普通语料重复次数（小语料扩量用）")
     parser.add_argument("--out", type=str, default="lm_state_motion.pt")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -101,15 +102,17 @@ def main():
     state_token_id = stoi[STATE_TOKEN]
     print(f"vocab: {len(stoi)} (state token id = {state_token_id})")
 
-    # 2. 数据（state 维度从数据探测，兼容 32/64 维）
-    sx, sy, ss = build_state_samples(args.state_data, stoi)
-    state_dim = len(ss[0]) if ss else 64
+    # 2. 数据（state 维度从数据探测；无 state 数据时 state_dim=0 训纯文本模型）
+    sx, sy, ss = build_state_samples(args.state_data, stoi) if args.state_data else ([], [], [])
+    state_dim = len(ss[0]) if ss else 0
     # Δz 缩放系数（gen_state_data 落盘，存进 config 供推理端保持一致）
     dz_scale = 1.0
     if os.path.exists("state_scale.json"):
         with open("state_scale.json", "r", encoding="utf-8") as f:
             dz_scale = json.load(f).get("dz_scale", 1.0)
-    px, py, ps = build_plain_samples(args.plain_corpus, stoi, int(args.plain_budget * 1e6), state_dim)
+    px, py, ps = build_plain_samples(
+        args.plain_corpus, stoi, int(args.plain_budget * 1e6), state_dim, args.repeat
+    )
     print(f"state samples: {len(sx)} (dim {state_dim}, dz_scale {dz_scale:.1f}), plain samples: {len(px)}")
 
     xs = torch.tensor(sx + px, dtype=torch.long)

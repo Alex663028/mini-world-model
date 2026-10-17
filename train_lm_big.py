@@ -53,6 +53,8 @@ def main():
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--corpus", type=str, default=CORPUS_FILE, help="语料文件路径")
     parser.add_argument("--resume", type=str, default=None, help="从已有 checkpoint 续训（按形状匹配加载）")
+    parser.add_argument("--vocab-from", type=str, default=None,
+                        help="从该 checkpoint 继承词表（续训必传，防止 embedding 被打乱）")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default=CKPT_FILE)
     args = parser.parse_args()
@@ -67,8 +69,23 @@ def main():
         with open(args.corpus, "r", encoding="utf-8") as f:
             text = f.read()
 
-    stoi, itos = build_vocab(text)
-    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+    # 词表：--vocab-from 时从 checkpoint 继承（只追加新字符）
+    # 踩坑：重建词表会让续训语料的词表覆盖 checkpoint 的词表，
+    # embedding/head 因形状变化全废（参数 75.5M→69.6M，loss 2→6 爆炸）
+    if args.vocab_from and os.path.exists(args.vocab_from):
+        ck_v = torch.load(args.vocab_from, map_location="cpu")
+        stoi = dict(ck_v["stoi"])
+        itos = dict(ck_v["itos"])
+        added = 0
+        for ch in text:
+            if ch not in stoi:
+                stoi[ch] = len(stoi)
+                itos[len(itos)] = ch
+                added += 1
+        print(f"vocab: inherited {len(ck_v['stoi'])} from {args.vocab_from}, +{added} new -> {len(stoi)}")
+    else:
+        stoi, itos = build_vocab(text)
+    data = torch.tensor([stoi[c] for c in text if c in stoi], dtype=torch.long)
     print(f"corpus: {len(text)} chars, vocab: {len(stoi)}, tokens: {len(data)}")
 
     bs = args.block_size
