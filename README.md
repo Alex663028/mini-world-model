@@ -1,7 +1,35 @@
-# mini-world-model：从零搭建的最小世界模型
+# mini-world-model：微型世界模型 × 语言模型融合的具身 Agent
 
 一个 **CPU 几分钟就能训完** 的最小世界模型（world model），用来搞懂"世界模型"四个字到底是什么意思。
-全部代码约 500 行，纯 PyTorch + numpy，无 gym / box2d / CUDA 依赖。
+纯 PyTorch + numpy 实现，无 gym / box2d / CUDA 依赖。
+
+现已演进为完整系统：**世界模型 + 语言模型 + 常识库 + 符号计算器 + MPC/PD 导航**，
+统一为 `MiniWorldAgent` 单入口（`agent.py`），支持 CLI / HTTP API / MCP Server 三种调用方式。
+
+## 快速验证
+
+```bash
+pip install -r requirements.txt
+python agent.py --state                # 环境状态
+python agent.py "你看到了什么？"         # 感知（潜状态注入语言模型）
+python agent.py "光速是多少？"           # 常识（669 条检索）
+python agent.py "去目标那儿"             # 任务（MPC 规划 + PD 控制导航）
+python agent.py "23 乘以 7"              # 符号计算器
+```
+
+## 版本控制
+
+本仓库只跟踪代码与文档（约 300K）。权重（`*.pt`）、语料（`*.txt`）、
+配对数据（`*.jsonl`）都是训练产物，不进 git —— 全部可按流程重训生成，
+仓库保持轻量、diff 只反映代码变化：
+
+```bash
+python train.py                        # 世界模型（CPU 4 分钟）
+python train_lm_state.py --epochs 4    # L2 具身语言模型（GPU 约 12 分钟）
+```
+
+单独部署时把生产权重放在仓库根目录即可（`agent.py` 默认找
+`checkpoint.pt` + `lm_state.pt`）。
 
 ## 世界模型是什么
 
