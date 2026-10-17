@@ -1,0 +1,20 @@
+# ===== 权重与数据产物（重训可得，不进 git）=====
+*.pt
+*.txt
+*.jsonl
+*.json
+!requirements.txt
+
+# ===== 缓存与临时 =====
+__pycache__/
+*.pyc
+corpus_cache/
+
+# ===== 系统垃圾 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =====  IDE =====
+.vscode/
+.idea/
