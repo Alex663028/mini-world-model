@@ -78,6 +78,10 @@ CONFIG = {
     "top_k": 20,
     "history_window": 6,      # 多轮上下文窗口（轮）
     "kb_threshold": 0.45,     # 检索命中阈值
+    # ---- MPC 候选策略（借鉴 lingbot-world 的动作条件连续控制思想）----
+    "mpc_candidates": "continuous",  # "fixed8"（v1）或 "continuous"（v2）
+    "mpc_samples": 16,        # continuous 模式的随机采样数
+    "aim_horizon": 24,        # 想象窗口（实验用，v1 是 12）
 }
 
 # 各类意图的关键词路由（按优先级排列，具体词优先于宽泛词）
@@ -145,6 +149,7 @@ class MiniWorldAgent:
         self.history = []
         self.last_z = None  # 上一帧潜状态（运动感知 Δz 用）
         self.http_tools = {}  # 远程 HTTP 工具注册表
+        self._prev_a = np.zeros(2, dtype=np.float32)  # 上一个动作（惯性候选用）
         self._lock = threading.Lock()
 
     def _load_lm(self, path):
@@ -530,12 +535,50 @@ class MiniWorldAgent:
         ang = math.degrees(math.atan2(-dy, dx))
         return DIR8[int(((ang + 22.5) % 360) // 45)]
 
+    def _mpc_candidates(self, d0, throttle):
+        """构造 MPC 候选动作集。
+
+        v1（fixed8）：8 个等分方向 × 油门 + 惯性 + 减速。
+        v2（continuous）：借鉴 lingbot-world 的动作条件连续控制——
+        在"方向 × 幅度"空间连续采样，并**显式加入朝目标的精确方向**。
+        v1 的 8 个粗方向经常错过最优动作，这是导航失败的主要来源。
+        """
+        cfg = self.cfg
+        if cfg["mpc_candidates"] == "fixed8":
+            cands = [
+                np.array([np.cos(a), np.sin(a)], dtype=np.float32) * throttle
+                for a in np.linspace(0, 2 * np.pi, cfg["n_candidates"], endpoint=False)
+            ]
+            cands.append((self._prev_a * 0.8).astype(np.float32))
+            cands.append(np.zeros(2, dtype=np.float32))
+            return cands
+
+        # continuous：精确瞄准 + 环向采样 + 幅度扰动 + 惯性 + 减速
+        cands = []
+        vec = self.env.target - self.env.pos
+        n = float(np.linalg.norm(vec))
+        if n > 1e-6:
+            cands.append((vec / n * throttle).astype(np.float32))
+            # 瞄准方向的 ±20° 邻域（世界模型对直冲动作常有偏置）
+            base_ang = math.atan2(vec[1], vec[0])
+            for da in (-0.35, -0.17, 0.17, 0.35):
+                cands.append(np.array([math.cos(base_ang + da),
+                                       math.sin(base_ang + da)], dtype=np.float32) * throttle)
+        rng = np.random.default_rng(int(self.env.steps * 31 + len(self.history) * 7))
+        for _ in range(cfg["mpc_samples"]):
+            a_ang = rng.uniform(0, 2 * np.pi)
+            mag = throttle * rng.uniform(0.55, 1.15)
+            cands.append(np.array([math.cos(a_ang), math.sin(a_ang)],
+                                  dtype=np.float32) * mag)
+        cands.append((self._prev_a * 0.8).astype(np.float32))
+        cands.append(np.zeros(2, dtype=np.float32))
+        return cands
+
     def _run_navigation(self):
         """语言即任务：MPC 规划 + PD 控制分层，带进度汇报与超时保护。
 
         并发安全：整个导航持锁执行，避免 HTTP 多客户端争用 env 状态。
         """
-        cfg = self.cfg
         with self._lock:
             return self._run_navigation_locked()
 
@@ -560,12 +603,7 @@ class MiniWorldAgent:
                 if d0 > cfg["approach_dist"] and stuck < cfg["stuck_limit"]:
                     # 规划层：MPC 想象（世界模型的主场）
                     throttle = min(0.7, max(0.3, d0 * 1.2))
-                    candidates = [
-                        np.array([np.cos(a), np.sin(a)], dtype=np.float32) * throttle
-                        for a in np.linspace(0, 2 * np.pi, cfg["n_candidates"], endpoint=False)
-                    ]
-                    candidates.append((prev_a * 0.8).astype(np.float32))
-                    candidates.append(np.zeros(2, dtype=np.float32))
+                    candidates = self._mpc_candidates(d0, throttle)
                     best_a, best_pd = None, np.inf
                     for a in candidates:
                         zc = z
@@ -592,7 +630,7 @@ class MiniWorldAgent:
                         switches += 1
 
                 obs, _, done, info = self.env.step(best_a)
-                prev_a = best_a
+                prev_a = self._prev_a = best_a
                 steps_used = step + 1
                 stuck = stuck + 1 if info["dist"] >= d0 - 0.01 else 0
                 if steps_used % cfg["report_every"] == 0 and not done:
