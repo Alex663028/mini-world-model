@@ -95,7 +95,7 @@ DIR8 = ["正东", "东北", "正北", "西北", "正西", "西南", "正南", "�
 
 class MiniWorldAgent:
     def __init__(self, world_ckpt="checkpoint.pt", lm_ckpt="lm_state.pt",
-                 dialog_ckpt="lm_dialog.pt", seed=None, config=None):
+                 dialog_ckpt="lm_unified.pt", seed=None, config=None):
         cfg = dict(CONFIG)
         if config:
             cfg.update(config)
@@ -115,10 +115,10 @@ class MiniWorldAgent:
         self.env.reset()
 
         # ---- 语言层：双模型分工 ----
-        # lm = 具身感知模型（潜状态注入，回答"你在哪/看到什么"）
-        # lm_dialog = 对话模型（闲聊/自述/能力介绍，从高质量对话语料专精）
-        # 分工的依据：一个模型干两件事两头都不灵——实测单模型要么感知好但闲聊崩，
-        # 要么闲聊好但感知退化为百科幻觉
+        # lm = 具身感知模型（潜状态注入，回答"你在哪/看到什么"）——世界模型的"眼睛"
+        # lm_dialog = 三域文本模型（对话 + 知识 + 世界叙述，混合语料专精）
+        # 分工的依据：一个模型干两件事两头都不灵——感知靠潜状态注入，
+        # 纯文本域（闲聊/知识/叙述）靠混合语料，两者互补而非替代
         loaded = self._load_lm(lm_ckpt)
         if loaded:
             self.lm, self.stoi, self.itos, lm_cfg = loaded
@@ -243,7 +243,7 @@ class MiniWorldAgent:
         if self.lm is None:
             return self._fallback_perception()
         state = self.perceive()
-        return self._generate(question, state=state)
+        return self._generate(question, state=state, use_ctx=False)  # 感知通道不带历史
 
     def _fallback_perception(self):
         pos, target = self.env.pos, self.env.target
@@ -280,10 +280,13 @@ class MiniWorldAgent:
         gen = "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):]
         return gen.strip().rstrip("问：答").strip("： ")
 
-    def _generate(self, question, state=None, max_tokens=None, temperature=None, top_k=None):
+    def _generate(self, question, state=None, max_tokens=None, temperature=None, top_k=None,
+                  use_ctx=True):
         """语言模型生成；state 非空时插入 [STATE] token 并注入潜状态。
 
-        带多轮上下文：prompt 里附最近几轮问答（记忆从死到活）。
+        use_ctx=False 时不带多轮上下文——感知通道必须关掉它：
+        历史问答（含知识域的长答案）会挤掉 [STATE] 的位置，
+        实测导致 state 注入失效、回答退化成百科幻觉。
         """
         cfg = self.cfg
         max_tokens = max_tokens or cfg["max_tokens"]
@@ -292,12 +295,13 @@ class MiniWorldAgent:
 
         # 多轮上下文（最近 N 轮，含本轮问题）
         ctx = ""
-        recent = [h for h in self.history[-(cfg["history_window"] * 2):]]
-        for role, msg in recent:
-            if role == "user":
-                ctx += f"问：{msg}\n"
-            else:
-                ctx += f"答：{msg[:40]}\n"
+        if use_ctx:
+            recent = [h for h in self.history[-(cfg["history_window"] * 2):]]
+            for role, msg in recent:
+                if role == "user":
+                    ctx += f"问：{msg}\n"
+                else:
+                    ctx += f"答：{msg[:40]}\n"
         if state is not None and self.state_token_id is not None:
             prompt = f"{ctx}问：{question}\n{STATE_TOKEN}{PROMPT_END}"
         else:
