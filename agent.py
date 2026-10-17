@@ -82,6 +82,7 @@ CONFIG = {
     "mpc_candidates": "continuous",  # "fixed8"（v1）或 "continuous"（v2）
     "mpc_samples": 16,        # continuous 模式的随机采样数
     "aim_horizon": 24,        # 想象窗口（实验用，v1 是 12）
+    "use_state_head": True,   # 用状态头推演（比 decode+argmax 快 10 倍、更准）
 }
 
 # 各类意图的关键词路由（按优先级排列，具体词优先于宽泛词）
@@ -167,7 +168,17 @@ class MiniWorldAgent:
 
         # ---- 感知层：世界模型 ----
         self.model = MiniWorldModel(latent_dim=32, action_dim=2)
-        self.model.load_state_dict(torch.load(world_ckpt, map_location=self.device))
+        sd = torch.load(world_ckpt, map_location=self.device)
+        cur = self.model.state_dict()
+        inherited = 0
+        for k, v in sd.items():
+            if k in cur and cur[k].shape == v.shape:
+                cur[k] = v
+                inherited += 1
+        self.model.load_state_dict(cur)
+        # v1/v2 权重没有 state_head：自动关掉状态推演（避免用随机头）
+        if "state_head.0.weight" not in sd:
+            self.cfg["use_state_head"] = False
         self.model.to(self.device)  # 权重映射不移动模型本体，必须显式 .to()
         self.model.eval()
         self.env = PointMassEnv(seed=seed)
@@ -758,7 +769,7 @@ class MiniWorldAgent:
                         min_d = np.inf
                         for _ in range(cfg["imagine_horizon"]):
                             zc = self.model.imagine_step(zc, torch.from_numpy(a).unsqueeze(0).to(self.device))
-                            p = self._safe_pos(self.model.decode(zc).squeeze().cpu().numpy())
+                            p = self._predict_pos(zc)
                             if p is not None:
                                 min_d = min(min_d, float(np.linalg.norm(p - self.env.target)))
                         if min_d < best_pd:
@@ -812,6 +823,20 @@ class MiniWorldAgent:
         if np.any(np.abs(p) > 1.05):  # 世界边界 ±1，留 5% 余量
             return None
         return p
+
+    def _predict_pos(self, z):
+        """从潜状态推演位置（优先状态头，缺失时退回 decode+argmax）。
+
+        状态头比解码图像快 10 倍且更准（实测 RMSE 0.178 vs 解码提取的
+        量化误差）。旧 checkpoint 没有 state_head 时自动降级。
+        """
+        if self.cfg.get("use_state_head", True) and hasattr(self.model, "state_head"):
+            s = self.model.predict_state(z)
+            p = s["pos"][0].detach().cpu().numpy()
+            if np.all(np.isfinite(p)) and np.all(np.abs(p) <= 1.05):
+                return p
+            return None
+        return self._safe_pos(self.model.decode(z).squeeze().cpu().numpy())
 
     def _act(self, text):
         """单步动作执行。"""

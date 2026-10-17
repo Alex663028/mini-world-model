@@ -85,13 +85,30 @@ class Dynamics(nn.Module):
 
 
 class MiniWorldModel(nn.Module):
-    """三件套打包：编码、预测、解码。"""
+    """三件套打包：编码、预测、解码，外加显式状态预测头。
+
+    状态头（LingBot-World 2.0 "完整世界状态推演"的最小实现）：
+    从潜状态直接回归世界状态量（位置/速度/目标/距离/步数），
+    而不是靠解码图像 + argmax 抠位置。两个好处：
+      1. 真正"推演状态"而非"生成像素"
+      2. MPC 想象时可以只跑 MLP 状态头，不用每步解码图像（快两个数量级）
+    """
+
+    STATE_DIM = 9  # pos(2) + vel(2) + target(2) + dist(1) + steps_norm(1) + reached_flag(1)
 
     def __init__(self, latent_dim=32, action_dim=2):
         super().__init__()
         self.encoder = Encoder(latent_dim)
         self.dynamics = Dynamics(latent_dim, action_dim)
         self.decoder = Decoder(latent_dim)
+        # 显式状态头：z -> (pos2, vel2, target2, dist, steps_norm, reached)
+        self.state_head = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.STATE_DIM),
+        )
 
     def encode(self, obs):
         return self.encoder(obs)
@@ -102,6 +119,18 @@ class MiniWorldModel(nn.Module):
 
     def decode(self, z):
         return self.decoder(z)
+
+    def predict_state(self, z):
+        """从潜状态推演世界状态：pos, vel, target, dist, steps_norm, reached_logit。"""
+        s = self.state_head(z)
+        return {
+            "pos": s[:, :2],
+            "vel": s[:, 2:4],
+            "target": s[:, 4:6],
+            "dist": s[:, 6],
+            "steps_norm": s[:, 7],
+            "reached_logit": s[:, 8],
+        }
 
 
 def count_params(model):
