@@ -66,6 +66,65 @@ lm_unified（对话+知识+世界叙述）──组织语言──> 四层兜底
 （实测：先问 4 个知识问题再问"你看到了什么"，答成美国奇幻电影）。
 修法：`_generate(..., use_ctx=False)`——感知是不依赖对话历史的独立通道。
 
+## 对照 MiniMind：SFT 阶段落地（jingyaogong/minimind）
+
+参考 [MiniMind](https://github.com/jingyaogong/minimind) 的训练流水线，
+把我们的语言模型从"预训练式续训"升级为规范的两阶段：
+
+```
+Pretrain（已有 lm_final2：2040 万字符工业语料）
+    ↓
+SFT（train_sft.py + sft_data.jsonl）  ← 本节新增
+    ↓
+（后续可选）LoRA / DPO / Agentic RL
+```
+
+### 对照表：我们借鉴了什么
+
+| MiniMind 做法 | 我们之前 | 现在的做法 |
+|---|---|---|
+| Pretrain → SFT 两阶段 | 混合语料续训（粗糙） | 规范 SFT：`train_sft.py` |
+| **SFT 只对 assistant 算 loss** | 全序列 loss（100% token） | loss mask：**22.9% token** 参与训练，算力省 4 倍 |
+| conversations 格式（多轮） | 扁平"问：X 答：Y" | `{"conversations": [{role, content}...]}` |
+| Tool Call 混进 SFT | 无 | 68 条工具调用轨迹（感知/导航/检索/计算/想象） |
+| cosine lr + warmup | 固定 lr | `cosine_lr()`（warmup 10% → 余弦衰减到 10%） |
+| 梯度裁剪 | 无 | `clip_grad_norm_(1.0)` |
+| 断点续训存优化器状态 | 只存权重 | checkpoint 含 `opt.state_dict()` |
+| 词表 6400 BPE+ByteLevel | char-level 4997 | **待办**（见下方路线） |
+
+### SFT 数据集（799 条）
+
+- 多轮对话（含 system prompt 交代身份，40% 是 2-3 轮追问）
+- 知识问答（669 条常识库自动生成）
+- **Tool Call 轨迹**（68 条）：user → assistant(tool_calls) → tool(结果) → assistant(总结)
+
+### 关键坑：loss mask 必须在右移之后
+
+TinyGPT 的约定是 `labels[i] = ids[i+1]`（预测下一 token）。
+SFT 第一版我让 labels 与 ids **平行**——等于教模型"预测自己"，
+loss 假性趋零到 **0.0012**，但生成全是"："。正确做法是
+`SFTDataset` 输出 `(ids, learn_flags)`，由 `collate` 做右移后再按
+learn_flags 施加 mask。修正后 loss 曲线正常（2.97→1.39→0.72→0.46）。
+
+### 诚实的现状
+
+SFT 模型能正确回答知识问答（"长城是什么"→ 古代防御工程体系），
+也能输出工具调用格式（`[调用工具 calc]`）。但 799 条数据量太小，
+4 个 epoch 后过拟合到"（认真回答）关于「X」"的模板。
+**因此暂不替换 agent 的生产配置**（lm_unified + 系统查表 + 检索仍然更稳），
+把 SFT 链路作为下一阶段的资产。
+
+### 下一步路线（MiniMind 式）
+
+1. **BPE 词表**（6400，ByteLevel）：解决 char-level 效率问题
+   （中文压缩率 1.5-1.7 字符/token vs char-level 的 1.0），
+   同时把 embedding 参数占比压下来——这是 MiniMind 明确的设计取舍
+2. **扩 SFT 数据到 1 万条**：从当前 799 条扩到能覆盖真实问答分布
+3. **Tool Call 闭环**：模型输出工具调用 → agent 实际执行 → 结果回灌
+   （我们的环境能自动生成轨迹，这是真实 agent 系统最缺的）
+4. **Agentic RL**：环境反馈做 reward，用 GRPO 优化导航策略
+   （MiniMind 的 train_agent.py 思路）
+
 ## 对话能力：双模型分工（lm_dialog）
 
 单模型干两件事两头都不灵——实测要么感知好但闲聊崩（"你好"答成百科电影条目），
