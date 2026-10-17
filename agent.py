@@ -144,6 +144,7 @@ class MiniWorldAgent:
         # ---- 记忆层 + 并发锁（HTTP 多客户端共享实例时保护 env 状态）----
         self.history = []
         self.last_z = None  # 上一帧潜状态（运动感知 Δz 用）
+        self.http_tools = {}  # 远程 HTTP 工具注册表
         self._lock = threading.Lock()
 
     def _load_lm(self, path):
@@ -169,7 +170,43 @@ class MiniWorldAgent:
 
     # ==================== 主入口：统一路由 ====================
 
-    # ==================== Agentic 模式：模型自主决定调工具 ====================
+    # ==================== 远程工具（HTTP） ====================
+
+    def register_http_tool(self, name, endpoint, payload=None):
+        """注册一个远程 HTTP 工具（真实 agent 的标配：跨进程/跨机调用）。
+
+        endpoint 例：http://127.0.0.1:8399/reply
+        payload 可给固定 body，或由调用方传 question/text 覆盖。
+        """
+        self.http_tools[name] = {"endpoint": endpoint, "payload": payload or {}}
+
+    def _call_http_tool(self, name, question=""):
+        """通过 HTTP 调用远程工具（标准库 urllib，零依赖）。"""
+        import urllib.error
+        import urllib.request
+
+        spec = self.http_tools[name]
+        body = dict(spec["payload"])
+        body.setdefault("text", question)
+        body.setdefault("question", question)
+        try:
+            req = urllib.request.Request(
+                spec["endpoint"],
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            for key in ("reply", "answer", "result"):
+                if data.get(key):
+                    return str(data[key])
+            if data.get("state"):
+                return json.dumps(data["state"], ensure_ascii=False)
+            return "远程服务没有返回可用结果"
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            return f"远程工具 {name} 调用失败：{e}"
+
+# ==================== Agentic 模式：模型自主决定调工具 ====================
 
     SFT_SYSTEM = (
         "你是小WM，一个由世界模型和语言模型组成的迷你 agent。"
@@ -194,7 +231,12 @@ class MiniWorldAgent:
         return "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):].strip()
 
     def execute_tool(self, name, question=""):
-        """执行工具调用——agentic 模式与路由模式共用同一套工具实现。"""
+        """执行工具调用——agentic 模式与路由模式共用同一套工具实现。
+
+        优先查远程 HTTP 工具（跨进程能力），没有再走本地工具。
+        """
+        if name in getattr(self, "http_tools", {}):
+            return self._call_http_tool(name, question)
         if name == "world_perceive":
             return self.reply("你看到了什么？")
         if name == "world_navigate":

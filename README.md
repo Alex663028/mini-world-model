@@ -133,15 +133,54 @@ python agent.py --agentic --dialog lm_sft2.pt "23 乘以 7 等于几"
 实测端到端：感知（真跑世界模型编码器）→ 结果回灌 → 模型描述画面；
 算术（符号计算器）→ 161；知识问答不调工具直接答。
 
+### 远程工具：跨进程调用
+
+`register_http_tool()` 让 agent 把任意 HTTP 端点注册为工具
+（同名可覆盖本地实现，`execute_tool` 优先查远程表）：
+
+```python
+bot.register_http_tool("kb_query", "http://127.0.0.1:8399/kb")
+bot.reply_agentic("柏拉图是谁")   # → 模型调 kb_query → HTTP 到另一个进程 → 总结答案
+```
+
+实测：跨进程调用 `api_server.py` 的 `/kb` 端点成功拿回答案，
+未命中返回"远程服务没有返回可用结果"（而不是裸 JSON）。
+
 两种模式的分工：
 - **路由模式（默认）**：关键词路由 + 潜状态注入，感知精确度更稳（生产用）
 - **Agentic 模式**：模型自主决策工具，展示的是"模型会规划调用"的能力
 
+### BPE 分词器（零依赖从零实现，压缩率 1.82）
+
+`bpe_tokenizer.py` 从零实现标准字符级 BPE（pip 的 `tokenizers` 装不上，
+不如自己写）。6400 词表（2053 字符 + 4347 merges），训练语料 57.5 万字符。
+
+```
+21 字 -> 11 token | 世界模型是一类预测环境动态的神经网络模型
+压缩率: 1.82 字符/token（char-level 是 1.00；MiniMind 的 BPE 是 1.5-1.7）
+学到的 token: 世界模型 / 语言模型 / 小WM / 目标 / 规划 / 画面 / 64 ...
+```
+
+**为什么超过 MiniMind 的 1.5-1.7**：我们的语料是结构化对话，
+"世界模型""语言模型""小WM"这类术语反复出现，BPE 能合并成长片段；
+通用语料更杂，同样的词表学不到这么长的公共片段。
+
+**意义**：同等上下文长度下 token 数减少 45%——char-level 的效率天花板
+（下午诊断出的"记忆天花板"根因）由此解决。代价是**全链路重训**
+（词表变了，所有权重都不兼容）：
+
+```bash
+python bpe_tokenizer.py --train --vocab-size 6400 --out bpe_6400.json
+# 迁移步骤：① TinyGPT 接入 BPE 编码（替换 stoi/itos）
+#          ② 用 bpe.encode() 重 tokenize 预训练语料（需重新 download_corpus）
+#          ③ 全量重训 pretrain → SFT → 感知模型
+#          ④ gen_state_data / train_lm_state 改用 BPE 编码
+```
+bpe_6400.json 已存档（634KB），作为下一阶段起点。
+
 ### 下一步路线（MiniMind 式）
 
-1. **BPE 词表**（6400，ByteLevel）：解决 char-level 效率问题
-   （中文压缩率 1.5-1.7 字符/token vs char-level 的 1.0），
-   同时把 embedding 参数占比压下来——这是 MiniMind 明确的设计取舍
+1. **BPE 全链路重训**（上面已写迁移步骤，约 2-3 小时）
 2. **扩 SFT 数据到 1 万条**：从当前 3503 条扩到能覆盖真实问答分布
 3. **Agentic RL**：环境反馈做 reward，用 GRPO 优化导航策略
    （MiniMind 的 train_agent.py 思路）
