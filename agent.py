@@ -169,6 +169,77 @@ class MiniWorldAgent:
 
     # ==================== 主入口：统一路由 ====================
 
+    # ==================== Agentic 模式：模型自主决定调工具 ====================
+
+    SFT_SYSTEM = (
+        "你是小WM，一个由世界模型和语言模型组成的迷你 agent。"
+        "你能看见 64×64 灰度画面里的自己和目标环、能规划路径走过去、"
+        "能查询常识、能做四则运算。需要这些能力时，你会调用对应工具。"
+    )
+
+    def _sft_generate(self, prompt, max_tokens=90, temperature=0.3, top_k=10):
+        """用 SFT 模型生成（conversations 格式：系统/用户/助手）。"""
+        if self.lm_dialog is None:
+            return ""
+        idx = torch.tensor(
+            [[self.lm_dialog_stoi[c] for c in prompt if c in self.lm_dialog_stoi]],
+            dtype=torch.long, device=self.device,
+        )
+        nl = {self.lm_dialog_stoi["\n"]} if "\n" in self.lm_dialog_stoi else None
+        with torch.no_grad():
+            out = self.lm_dialog.generate(
+                idx, max_new_tokens=max_tokens, temperature=temperature,
+                top_k=top_k, stop_ids=nl,
+            )
+        return "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):].strip()
+
+    def execute_tool(self, name, question=""):
+        """执行工具调用——agentic 模式与路由模式共用同一套工具实现。"""
+        if name == "world_perceive":
+            return self.reply("你看到了什么？")
+        if name == "world_navigate":
+            return self._run_navigation()
+        if name == "world_imagine":
+            return self._imagine("想象一下往左走")
+        if name == "world_act":
+            return self._act("往前走")
+        if name == "kb_query":
+            hit = self._retrieve(question)
+            return hit[0] if hit else "常识库没有这条"
+        if name == "calc":
+            return self._try_calc(question) or "算式没解析出来"
+        return f"未知工具 {name}"
+
+    @staticmethod
+    def _parse_tool(text):
+        """从生成文本里解析 [调用工具 name]。"""
+        if "[调用工具" not in text:
+            return None, ""
+        body = text.split("[调用工具", 1)[1]
+        name = body.split("]")[0].strip()
+        return name, text.split("]", 1)[1] if "]" in text else ""
+
+    def reply_agentic(self, text, max_rounds=3):
+        """模型驱动的工具调用循环（MiniMind Agentic 模式）。
+
+        与路由模式的区别：不是关键词规则决定调哪个工具，而是 SFT 模型
+        自己输出工具调用，agent 执行后把结果回灌，让模型总结成自然语言。
+
+        注意：路由模式在感知精确度上仍更稳（潜状态直读），
+        agentic 模式展示的是"模型自主决策工具"的能力。
+        """
+        prompt = f"系统：{self.SFT_SYSTEM}\n用户：{text}\n助手："
+        for _ in range(max_rounds):
+            gen = self._sft_generate(prompt)
+            if not gen:
+                break
+            tool, _ = self._parse_tool(gen)
+            if not tool:
+                return gen
+            result = self.execute_tool(tool, text)
+            prompt += f"{gen}\n结果：{result}\n助手："
+        return self._sft_generate(prompt)
+
     def reply(self, text):
         """统一入口。带错误降级：任何子能力失败不影响其他能力。"""
         text = text.strip()
@@ -606,10 +677,13 @@ def main():
     parser.add_argument("text", nargs="*", help="要说的内容（空则进入交互）")
     parser.add_argument("--json", action="store_true", help="JSON 格式输出")
     parser.add_argument("--state", action="store_true", help="输出环境状态后退出")
-    parser.add_argument("--lm", default="lm_state.pt", help="语言模型 checkpoint")
+    parser.add_argument("--lm", default="lm_state.pt", help="感知语言模型 checkpoint")
+    parser.add_argument("--dialog", default="lm_unified.pt", help="对话语言模型 checkpoint")
+    parser.add_argument("--agentic", action="store_true",
+                        help="agentic 模式：由 SFT 模型自主决定调用哪个工具（需配 lm_sft2.pt）")
     args = parser.parse_args()
 
-    bot = MiniWorldAgent(lm_ckpt=args.lm)
+    bot = MiniWorldAgent(lm_ckpt=args.lm, dialog_ckpt=args.dialog)
     text = " ".join(args.text).strip()
 
     if args.state:
@@ -625,7 +699,7 @@ def main():
         return
 
     if text:
-        reply = bot.reply(text)
+        reply = bot.reply_agentic(text) if args.agentic else bot.reply(text)
         if args.json:
             print(json.dumps({
                 "input": text,
