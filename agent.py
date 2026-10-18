@@ -94,7 +94,8 @@ TASK_KEYS = ["去目标", "走到目标", "导航", "前往", "到达目标", "�
 RESET_KEYS = ["重置", "换一个目标", "换目标", "新目标", "重新开始", "新回合", "再来"]
 BOUNDARY_KEYS = ["墙在哪", "边界", "会撞墙", "四周", "边上有"]
 PERCEPTION_KEYS = ["看到", "眼前", "画面", "观测", "在哪", "哪个方向", "什么方向",
-                   "多远", "方位", "位置", "周围", "环境", "多快", "速度"]
+                   "多远", "方位", "位置", "周围", "环境", "多快", "速度",
+                   "往哪", "朝哪", "运动方向", "移动方向"]
 IMAGINE_KEYS = ["想象一下", "想象", "梦境", "推演", "rollout"]
 ACT_KEYS = ["往前走", "向前走", "往左", "向左", "往右", "向右", "往后退", "推一下", "走一步"]
 LATENT_KEYS = ["潜状态", "latent", "编码", "表征"]
@@ -165,6 +166,14 @@ class MiniWorldAgent:
             cfg.update(config)
         self.cfg = cfg
         seed = seed if seed is not None else cfg["seed"]
+
+        # ---- 权重自动探测 ----
+        # 从 Release 下载的人通常只有 lm_state_bpe.pt（融合模型，感知更强），
+        # 没有 lm_state.pt（char 感知）。默认名找不到时自动升级到融合模型，
+        # 免得用户必须记住 --lm 参数。
+        if lm_ckpt == "lm_state.pt" and not os.path.exists(lm_ckpt) \
+                and os.path.exists("lm_state_bpe.pt"):
+            lm_ckpt = "lm_state_bpe.pt"
 
         # ---- 设备统一：世界模型与语言模型同设备（消除 CPU-GPU 跨设备拷贝）----
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -299,7 +308,11 @@ class MiniWorldAgent:
                 # 注意 checkpoint 存的 stoi 是纯 BPE 词表（6400），
                 # 而 BPE 适配器的 vocab_size 含特殊 token（6401）——差一。
                 tok = load_tokenizer("bpe_6400.json")
-                if tok is not None and tok.vocab_size - 1 == len(ck["stoi"]):
+                # 兼容两种历史格式：早期 checkpoint 的 stoi 是纯 BPE 词表（6400），
+                # 后来的 train_lm_state 把 [STATE] 也加进 stoi（6401）。
+                # 用 head.weight 行数做上界判断，别写死 -1（踩过：条件永远为假，
+                # BPE 模型被当成 char 模型加载，itos=None 直接崩）。
+                if tok is not None and len(ck["stoi"]) in (tok.vocab_size, tok.vocab_size - 1):
                     stoi, itos = tok, None
                     self._bpe_mode = True
             return model, stoi, itos, c
@@ -364,8 +377,9 @@ class MiniWorldAgent:
                 idx, max_new_tokens=max_tokens, temperature=temperature,
                 top_k=top_k, stop_ids=stop_ids,
             )
-        decoded = self._decode_text(out[0].tolist(), self.lm_dialog_itos)
-        return decoded[len(self._decode_text(idx[0].tolist(), self.lm_dialog_itos)):].strip()
+        decoded = self._decode_text(out[0].tolist(), self.lm_dialog_itos, self.lm_dialog_stoi)
+        return decoded[len(self._decode_text(idx[0].tolist(), self.lm_dialog_itos,
+                                             self.lm_dialog_stoi)):].strip()
 
     def _sft_prompt(self, text):
         """按对话模型的训练格式构造 prompt（BPE 版用系统/用户/助手，char 版用问/答）。"""
@@ -589,7 +603,8 @@ class MiniWorldAgent:
                 idx, max_new_tokens=max_tokens, temperature=temperature,
                 top_k=top_k, stop_ids=stop_ids,
             )
-        return self._decode_text(out[0].tolist(), self.lm_dialog_itos)[len(prompt):].strip()
+        return self._decode_text(out[0].tolist(), self.lm_dialog_itos,
+                                 self.lm_dialog_stoi)[len(prompt):].strip()
 
     def _encode_text(self, text, stoi):
         """编码：BPE 模式走 tokenizer，char 模式查表。"""
@@ -598,9 +613,15 @@ class MiniWorldAgent:
         return torch.tensor([[stoi[c] for c in text if c in stoi]],
                             dtype=torch.long, device=self.device)
 
-    def _decode_text(self, ids, itos):
-        if itos is None and isinstance(self.lm_dialog_stoi, BPETokenizerAdapter):
-            return self.lm_dialog_stoi.decode(ids)
+    def _decode_text(self, ids, itos, stoi=None):
+        """解码：itos 为 None 说明是 BPE 模型，用对应的 tokenizer 解码。
+
+        坑：以前用 self.lm_dialog_stoi 判断 BPE，导致"对话模型是 char、
+        感知模型是 BPE"时走到 char 分支，对 None 索引直接崩。
+        必须按传入模型自己的 tokenizer 判断。
+        """
+        if itos is None:
+            return stoi.decode(ids) if isinstance(stoi, BPETokenizerAdapter) else ""
         return "".join(itos[i] for i in ids)
 
     @staticmethod
@@ -638,14 +659,20 @@ class MiniWorldAgent:
             prompt = f"{ctx}问：{question}\n{STATE_TOKEN}{PROMPT_END}"
         else:
             prompt = f"{ctx}问：{question}{PROMPT_END}"
-        idx = self._encode(prompt)
-        stop_ids = {self.stoi[c] for c in "\n" if c in self.stoi}
+        idx = self._encode_text(prompt, self.stoi)
+        stop_ids = self._stop_ids(self.stoi)
         with torch.no_grad():
             out = self.lm.generate(
                 idx, max_new_tokens=max_tokens, temperature=temperature,
                 top_k=top_k, stop_ids=stop_ids, state=state,
             )
-        gen = "".join(self.itos[i] for i in out[0].tolist())[len(prompt):]
+        decoded = self._decode_text(out[0].tolist(), self.itos, self.stoi)
+        gen = decoded[len(prompt):]
+        # BPE 模式没有 stop_ids（'\n' 被合并进长 token），生成会继续到 max_tokens，
+        # 解码后按分隔符截断第一段——否则会输出 "答：...\n问：...\n答：..." 多轮串
+        for sep in ("\n", "问：", "答：", "系统：", "用户："):
+            if sep in gen:
+                gen = gen.split(sep)[0]
         return gen.strip().rstrip("问：答").strip("： ")
 
     def _retrieve(self, question, threshold=None):

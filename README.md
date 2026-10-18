@@ -1,6 +1,12 @@
 # mini-world-model
 
+[![Release](https://img.shields.io/github/v/release/Alex663028/mini-world-model)](https://github.com/Alex663028/mini-world-model/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 **从零训练的世界模型 × 语言模型 × 具身 Agent —— 单卡可复现的完整闭环**
+
+> 不想训练？[直接下载预训练权重](https://github.com/Alex663028/mini-world-model/releases/tag/v0.1.0)（790 MB），解压到根目录即可对话。
 
 一个 6.7K 行、纯 PyTorch 实现的最小具身智能系统：像素感知 → 潜空间动力学 → MPC 规划 → 动作执行 → 事件记忆 → 语言交互。
 所有模型**从零训练**（不 import transformers），单张 RX 6800 / RTX 3090 可完整复现，全部实测数据公开——**包括失败的实验**。
@@ -95,6 +101,30 @@ BPE 压缩率   2.22 字符/token    感知问答      零幻觉，距离误差 
 
 ## 5 分钟跑通
 
+### 路线 A：直接下载预训练权重（最快，不用训）
+
+从 [Release v0.1.0](https://github.com/Alex663028/mini-world-model/releases/tag/v0.1.0) 下载，放到仓库根目录：
+
+| 文件 | 大小 | 用途 |
+|---|---|---|
+| `checkpoint.pt` | 6.4 MB | 世界模型 v1（导航 16/16） |
+| `checkpoint_v3.pt` | 6.5 MB | 世界模型 v3（重建更清晰） |
+| `lm_unified.pt` | 289 MB | 语言模型：对话 + 知识 + 世界叙述 |
+| `lm_state_bpe.pt` | 488 MB | 融合模型：BPE 123M + 潜状态注入（感知） |
+
+```bash
+pip install -r requirements.txt
+python agent.py "你好"                    # 对话（lm_unified）
+python agent.py "你看到了什么？"           # 感知（自动用 lm_state_bpe）
+python agent.py "去目标那儿"               # 导航（世界模型 + MPC）
+python agent.py "23 乘以 7"                # 符号计算
+```
+
+权重按名字自动探测：`lm_state.pt` 不存在时自动升级到 `lm_state_bpe.pt`（融合模型），
+不用记参数。`bpe_6400.json` 词表已随仓库提供。
+
+### 路线 B：从零训练（想搞懂每一步）
+
 ```bash
 # 0. 依赖（torch 装 CPU 版即可跑世界模型）
 pip install -r requirements.txt
@@ -105,7 +135,7 @@ python train.py --episodes 400 --epochs 20
 # 2. 三个基础实验：一步预测 / 开环想象 / MPC 规划
 python demo.py          # 产出 demo_result.png
 
-# 3. CLI 交互（需要语言模型权重，见训练配方；缺失时自动降级）
+# 3. CLI 交互（语言模型见下方训练配方）
 python agent.py "你看到了什么？"     # 感知（真跑世界模型编码器）
 python agent.py "去目标那儿"         # 导航（MPC 规划）
 python agent.py "光速是多少？"       # 常识检索
