@@ -759,7 +759,7 @@ hf-mirror 限流严重——curl 带浏览器 UA + 请求间隔 5 秒，urllib �
 
 ```bash
 # GPU（RX 6800 16G，ROCm）：
-H:/ComfyUI_rocm/python_env/python.exe train_lm_big.py \
+python train_lm_big.py \
     --corpus corpus_industrial.txt --scale large --epochs 3 --out lm_industrial.pt
 ```
 
@@ -923,8 +923,8 @@ README.md    本文档
 
 ```bash
 python gen_state_data.py --episodes 150        # 生成配对数据（CPU 45 秒）
-H:/ComfyUI_rocm/python_env/python.exe train_lm_state.py --epochs 4   # GPU 11 分钟
-H:/ComfyUI_rocm/python_env/python.exe demo_state.py                  # 演示
+python train_lm_state.py --epochs 4   # GPU 11 分钟
+python demo_state.py                  # 演示
 ```
 
 从 lm_final2.pt 热启动（词表 4997→4998，embedding 行复制保留知识），
@@ -1040,15 +1040,15 @@ bot.reply("23 乘以 7")       # 符号层：计算器
 ### 1. CLI（命令行）
 
 ```bash
-H:/ComfyUI_rocm/python_env/python.exe agent.py "去目标那儿"
-H:/ComfyUI_rocm/python_env/python.exe agent.py "你看到了什么？" --json
-H:/ComfyUI_rocm/python_env/python.exe agent.py --state
+python agent.py "去目标那儿"
+python agent.py "你看到了什么？" --json
+python agent.py --state
 ```
 
 ### 2. HTTP API（stdlib 零依赖，端口 8399）
 
 ```bash
-H:/ComfyUI_rocm/python_env/python.exe api_server.py
+python api_server.py
 ```
 
 | 端点 | 方法 | 说明 |
@@ -1072,7 +1072,7 @@ curl -X POST http://127.0.0.1:8399/reply -H "Content-Type: application/json" -d 
 ### 3. MCP Server（9 个标准工具）
 
 ```bash
-H:/ComfyUI_rocm/python_env/python.exe mcp_server.py   # stdio 模式
+python mcp_server.py   # stdio 模式
 ```
 
 已写入 `~/.workbuddy/mcp.json`（server 名 `mini-world-agent`），
