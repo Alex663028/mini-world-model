@@ -265,8 +265,11 @@ class MiniWorldAgent:
         try:
             ck = torch.load(path, map_location=self.device)
             c = ck["config"]
+            # 词表大小以 head.weight 行数为准（BPE 训练时含特殊 token，
+            # 而保存的 stoi 是纯 BPE 词表——两者会差 1，用 head 形状最可靠）
+            vocab_n = ck["model"]["head.weight"].shape[0]
             model = TinyGPT(
-                vocab_size=len(ck["stoi"]),
+                vocab_size=vocab_n,
                 d_model=c["d_model"], n_heads=c["n_heads"],
                 n_layers=c["n_layers"], block_size=c["block_size"],
                 state_dim=c.get("state_dim", 0), state_token_id=c.get("state_token_id"),
@@ -276,9 +279,11 @@ class MiniWorldAgent:
             model.eval()
             stoi, itos = ck["stoi"], ck["itos"]
             if c.get("tokenizer") == "bpe_6400.json":
-                # BPE 模式：stoi 是 BPE 词表，itos 为 None；encode/decode 用 BPE
+                # BPE 模式：stoi 是 BPE 词表，itos 为 None；encode/decode 用 BPE。
+                # 注意 checkpoint 存的 stoi 是纯 BPE 词表（6400），
+                # 而 BPE 适配器的 vocab_size 含特殊 token（6401）——差一。
                 tok = load_tokenizer("bpe_6400.json")
-                if tok is not None and tok.vocab_size == len(ck["stoi"]):
+                if tok is not None and tok.vocab_size - 1 == len(ck["stoi"]):
                     stoi, itos = tok, None
                     self._bpe_mode = True
             return model, stoi, itos, c
@@ -333,20 +338,24 @@ class MiniWorldAgent:
     )
 
     def _sft_generate(self, prompt, max_tokens=90, temperature=0.3, top_k=10):
-        """用 SFT 模型生成（conversations 格式：系统/用户/助手）。"""
+        """用 SFT 模型生成。prompt 已是完整对话前缀（调用方按模型格式构造）。"""
         if self.lm_dialog is None:
             return ""
-        idx = torch.tensor(
-            [[self.lm_dialog_stoi[c] for c in prompt if c in self.lm_dialog_stoi]],
-            dtype=torch.long, device=self.device,
-        )
-        nl = {self.lm_dialog_stoi["\n"]} if "\n" in self.lm_dialog_stoi else None
+        idx = self._encode_text(prompt, self.lm_dialog_stoi)
+        stop_ids = self._stop_ids(self.lm_dialog_stoi)
         with torch.no_grad():
             out = self.lm_dialog.generate(
                 idx, max_new_tokens=max_tokens, temperature=temperature,
-                top_k=top_k, stop_ids=nl,
+                top_k=top_k, stop_ids=stop_ids,
             )
-        return "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):].strip()
+        decoded = self._decode_text(out[0].tolist(), self.lm_dialog_itos)
+        return decoded[len(self._decode_text(idx[0].tolist(), self.lm_dialog_itos)):].strip()
+
+    def _sft_prompt(self, text):
+        """按对话模型的训练格式构造 prompt（BPE 版用系统/用户/助手，char 版用问/答）。"""
+        if isinstance(self.lm_dialog_stoi, BPETokenizerAdapter):
+            return f"系统：{self.SFT_SYSTEM}\n用户：{text}\n助手："
+        return f"问：{text}\n答："
 
     def execute_tool(self, name, question="", **kwargs):
         """执行工具调用——agentic 模式与路由模式共用同一套工具实现。
@@ -443,7 +452,7 @@ class MiniWorldAgent:
         注意：路由模式在感知精确度上仍更稳（潜状态直读），
         agentic 模式展示的是"模型自主决策工具"的能力。
         """
-        prompt = f"系统：{self.SFT_SYSTEM}\n用户：{text}\n助手："
+        prompt = self._sft_prompt(text)
         for _ in range(max_rounds):
             gen = self._sft_generate(prompt)
             if not gen:

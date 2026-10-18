@@ -15,6 +15,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -51,9 +52,25 @@ class TokenDataset(Dataset):
         return self.xs[i], self.ys[i]
 
 
+class _TokenArrayDataset(Dataset):
+    """预编码 token 数组的切窗数据集。"""
+
+    def __init__(self, ids, block):
+        n = max(1, (len(ids) - 1) // block)
+        self.xs = [ids[i * block : i * block + block][:-1] for i in range(n)]
+        self.ys = [ids[i * block + 1 : i * block + block] for i in range(n)]
+
+    def __len__(self):
+        return len(self.xs)
+
+    def __getitem__(self, i):
+        return self.xs[i], self.ys[i]
+
+
 def collate(batch, block, pad_id):
     xs, ys = [], []
     for x, y in batch:
+        x, y = list(x), list(y)   # npy 取出的是 numpy 数组，先转 list
         px, py = block - len(x), block - len(y)
         xs.append(x + [pad_id] * px)
         ys.append(y + [pad_id] * py)
@@ -83,6 +100,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", nargs="*", default=[
         "corpus_mixed.txt", "corpus_dialog.txt", "sft_data_big.jsonl"])
+    parser.add_argument("--max-tokens", type=int, default=None, help="最多使用多少 token")
+    parser.add_argument("--tokens", type=str, default=None,
+                        help="预编码 token ids（.npy，tokenize_corpus.py 产出），"
+                             "给了就直接读，跳过 BPE encode")
     parser.add_argument("--bpe", type=str, default="bpe_6400.json")
     parser.add_argument("--out", type=str, default="lm_bpe_pretrain.pt")
     parser.add_argument("--epochs", type=int, default=15)
@@ -99,12 +120,21 @@ def main():
     tok = load_tokenizer(args.bpe)
     if tok is None:
         sys.exit("BPE 词表不存在，先跑 python bpe_tokenizer.py --train")
-    text = load_corpus_text(args.corpus)
-    print(f"corpus: {len(text)} chars")
 
-    ds = TokenDataset(text, tok, BLOCK)
-    print(f"tokens: {ds.n_tokens} (压缩率 {len(text) / ds.n_tokens:.2f} 字符/token), "
-          f"samples: {len(ds)}, block: {BLOCK} token")
+    if args.tokens and os.path.exists(args.tokens):
+        # 直接读预编码 token ids（大语料的标准做法）
+        ids_all = np.load(args.tokens)
+        if args.max_tokens and len(ids_all) > args.max_tokens:
+            ids_all = ids_all[: args.max_tokens]
+            print(f"截取前 {args.max_tokens} token（--max-tokens）")
+        ds = _TokenArrayDataset(ids_all, BLOCK)
+        print(f"tokens: {len(ids_all)} (from {args.tokens}), samples: {len(ds)}")
+    else:
+        text = load_corpus_text(args.corpus)
+        print(f"corpus: {len(text)} chars")
+        ds = TokenDataset(text, tok, BLOCK)
+        print(f"tokens: {ds.n_tokens} (压缩率 {len(text) / ds.n_tokens:.2f} 字符/token), "
+              f"samples: {len(ds)}, block: {BLOCK} token")
 
     pad_id = tok.eot_id
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,

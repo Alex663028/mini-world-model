@@ -269,6 +269,54 @@ python train_sft.py --bpe bpe_6400.json --data sft_data_big.jsonl
 这就是"先修架构再扩规模"的落点：**架构今天修完了（链路+四个 bug），
 规模是下一步的事（数据先行）**。
 
+## 扩规模：工业语料 + 104M BPE 模型（管线全就绪，模型待数据）
+
+按配方执行了完整扩规模，今天的所有管线升级都是为这一步：
+
+### 管线升级（三个工具级优化）
+
+1. **增量版 BPE 训练**（pair→位置索引 + 双向链表 + 堆）：
+   300 万字符从 10 分钟+ → **6.5 秒**（100 倍提速）。全扫描版
+   O(n×merges) 在工业语料上不可行，这决定了"工业语料训词表"可不可行。
+2. **BPE 分块/预编码**：`tokenize_corpus.py` 把 2500 万字符预编码成
+   `tokens_v3.npy`（2000 万 token，1.25 字符/token，1044 秒一次性的），
+   训练直接读 npy。
+3. **train_bpe.py --tokens**：跳过重复编码；`--max-tokens` 控制规模。
+
+### 扩规模数据链
+
+```
+download_corpus.py   → corpus_industrial.txt（54.4MB，23 秒，hf-mirror 很快）
+build_final_corpus.py → corpus_v3.txt（30.1M 字符，清洗去重后）
+bpe_tokenizer --train → bpe_6400.json（采样 300 万字符，6.5 秒）
+tokenize_corpus.py   → tokens_v3.npy（2000 万 token）
+train_bpe.py         → lm_bpe_big.pt（123.4M，16层/768，1000 万 token × 3ep，
+                       GPU 26 分钟，loss 6.77→5.40 仍在降）
+train_sft.py --bpe   → lm_bpe_big_sft.pt（loss 3.43→1.40）
+```
+
+### 结果（诚实版）
+
+| | 26M（手写语料） | **104M（工业语料）** | char-level 75M（生产） |
+|---|---|---|---|
+| 乱码 | 严重 | **无** | 无 |
+| 工具决策直测 | 无 | **3/5**（23×7→calc、长城→kb_query 对） | 路由层 100% |
+| agentic 多轮循环 | 崩 | 不稳（重复退化） | 稳定 |
+
+**104M 建立了泛化能力**（直测无乱码 + 部分工具决策），但两个短板明确：
+1. 1000 万 token 对 123M 太少（pretrain loss 还在降，没收敛）
+2. SFT 3542 条对 123M 不够（工具决策学不牢，agentic 循环退化）
+
+**下一步就是加数据**（管线已就绪，不用改代码）：
+```bash
+# 全量 pretrain（2000 万 token × 更多 epochs，约 1.5 小时）
+python train_bpe.py --tokens tokens_v3.npy --d-model 768 --n-layers 16 --epochs 6
+# SFT 数据扩到 2 万条（对话变体 + 工具轨迹自动生成）
+```
+
+生产配置保持 char-level 系列（路由模式全绿）。BPE 104M 作为已验证的备选，
+`MiniWorldAgent(dialog_ckpt="lm_bpe_big_sft.pt")` 可切换对比。
+
 ## 对照 MiniMind：SFT 阶段落地（jingyaogong/minimind）
 
 参考 [MiniMind](https://github.com/jingyaogong/minimind) 的训练流水线，
