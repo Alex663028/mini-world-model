@@ -102,6 +102,9 @@ BPE 压缩率   1.19（通用）/ 2.22（对话域）  感知问答   零幻觉�
 | `lm_unified.pt` | 289 MB | 语言模型：对话 + 知识 + 世界叙述 |
 | `lm_state_bpe.pt` | 488 MB | 融合模型：BPE 123M + 潜状态注入（感知） |
 
+> 只想跑起来：下这 4 个（790 MB）就够。
+> 想继续训练：Release 里还有 `lm_state.pt`（char 感知）和 `lm_bpe_big_sft.pt`（BPE 融合基座），共 1.7 GB。
+
 ```bash
 pip install -r requirements.txt
 python agent.py "你好"                    # 对话（lm_unified）
