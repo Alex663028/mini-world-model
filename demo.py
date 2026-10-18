@@ -74,6 +74,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, default="checkpoint.pt")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--out", type=str, default="demo_result.png")
     args = parser.parse_args()
 
     model = load_model(args.ckpt)
@@ -215,7 +216,7 @@ def main():
         ax.set_xticks([])
         ax.set_yticks([])
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    out = "demo_result.png"
+    out = args.out
     plt.savefig(out, dpi=110)
     print(f"saved -> {out}")
 
