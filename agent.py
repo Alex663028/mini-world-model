@@ -43,6 +43,7 @@ from env import PointMassEnv
 from knowledge import ALL_KNOWLEDGE
 from model import MiniWorldModel
 from tinygpt import TinyGPT
+from tokenizer import BPETokenizerAdapter, load_tokenizer
 
 # 常识索引打通大库（580 条）+ 小库（40 条）——
 # 曾经索引只建了小库，大库写了却没用上（审核发现的数据断点）
@@ -253,7 +254,12 @@ class MiniWorldAgent:
         return self.state.summary() + "细节：" + self.state.detail()
 
     def _load_lm(self, path):
-        """加载一个 TinyGPT checkpoint，返回 (model, stoi, itos, config) 或 None。"""
+        """加载一个 TinyGPT checkpoint，返回 (model, stoi, itos, config) 或 None。
+
+        支持两种词表：
+        - char（默认）：stoi 是字符表
+        - bpe_6400.json：config["tokenizer"] 记录路径，返回 BPE 适配器
+        """
         if not path or not os.path.exists(path):
             return None
         try:
@@ -268,7 +274,14 @@ class MiniWorldAgent:
             model.load_state_dict(ck["model"])
             model.to(self.device)  # 同上：显式移动模型本体
             model.eval()
-            return model, ck["stoi"], ck["itos"], c
+            stoi, itos = ck["stoi"], ck["itos"]
+            if c.get("tokenizer") == "bpe_6400.json":
+                # BPE 模式：stoi 是 BPE 词表，itos 为 None；encode/decode 用 BPE
+                tok = load_tokenizer("bpe_6400.json")
+                if tok is not None and tok.vocab_size == len(ck["stoi"]):
+                    stoi, itos = tok, None
+                    self._bpe_mode = True
+            return model, stoi, itos, c
         except Exception as e:
             sys.stderr.write(f"[agent] LM load failed ({path}: {e})\n")
             return None
@@ -544,18 +557,35 @@ class MiniWorldAgent:
         temperature = cfg["temperature"] if temperature is None else temperature
         top_k = top_k or cfg["top_k"]
         prompt = f"问：{question}{PROMPT_END}"
-        idx = torch.tensor(
-            [[self.lm_dialog_stoi[c] for c in prompt if c in self.lm_dialog_stoi]],
-            dtype=torch.long, device=self.device,
-        )
-        stop_ids = {self.lm_dialog_stoi[c] for c in "\n" if c in self.lm_dialog_stoi}
+        idx = self._encode_text(prompt, self.lm_dialog_stoi)
+        stop_ids = self._stop_ids(self.lm_dialog_stoi)
         with torch.no_grad():
             out = self.lm_dialog.generate(
                 idx, max_new_tokens=max_tokens, temperature=temperature,
                 top_k=top_k, stop_ids=stop_ids,
             )
-        gen = "".join(self.lm_dialog_itos[i] for i in out[0].tolist())[len(prompt):]
-        return gen.strip().rstrip("问：答").strip("： ")
+        return self._decode_text(out[0].tolist(), self.lm_dialog_itos)[len(prompt):].strip()
+
+    def _encode_text(self, text, stoi):
+        """编码：BPE 模式走 tokenizer，char 模式查表。"""
+        if isinstance(stoi, BPETokenizerAdapter):
+            return torch.tensor([stoi.encode(text)], dtype=torch.long, device=self.device)
+        return torch.tensor([[stoi[c] for c in text if c in stoi]],
+                            dtype=torch.long, device=self.device)
+
+    def _decode_text(self, ids, itos):
+        if itos is None and isinstance(self.lm_dialog_stoi, BPETokenizerAdapter):
+            return self.lm_dialog_stoi.decode(ids)
+        return "".join(itos[i] for i in ids)
+
+    @staticmethod
+    def _stop_ids(stoi):
+        """停止字符集合。BPE 模式下 '\n' 常被合并进长 token，单独查会拿到
+        错误的 id（实测 id 0 是真实 token，会把生成立刻掐断）——BPE 不用
+        stop_ids，改为解码后按字符截断。"""
+        if isinstance(stoi, BPETokenizerAdapter):
+            return None
+        return {stoi[c] for c in "\n" if c in stoi}
 
     def _generate(self, question, state=None, max_tokens=None, temperature=None, top_k=None,
                   use_ctx=True):

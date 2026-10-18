@@ -81,8 +81,13 @@ def train_bpe(text, vocab_size=6400):
                   f"seq len: {len(seq)} (压缩 {(1 - len(seq) / len(text)) * 100:.1f}%)",
                   flush=True)
 
+    base = len(vocab)
     for i, (a, b) in enumerate(merges):
-        vocab[a + b] = len(vocab) + i
+        # id 必须是 基础词表大小 + merge 序号。
+        # 坑：写成 len(vocab) + i 时 len 每轮在涨，最后一轮 id 会到
+        # 2053 + 2×4346 ≈ 10745，远超词表大小——encode 出的 id 全部越界，
+        # embedding 层直接 IndexError（实测踩过）。
+        vocab[a + b] = base + i
     return merges, vocab
 
 

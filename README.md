@@ -226,6 +226,49 @@ MiniMind 式:  [调用工具 world_navigate]
 **规划算法**入手（更长视野 + 状态记忆，或学一个真正的策略网络）。
 这是比"再训一版世界模型"更值得投入的方向。
 
+## BPE 全链路迁移（修架构：链路已通，效果待数据规模）
+
+今天完成了 char-level → BPE 的完整架构迁移，三个新文件：
+`tokenizer.py`（统一抽象）、`train_bpe.py`（预训练）、`train_sft.py --bpe`（SFT）。
+agent 可通过 `config["tokenizer"]="bpe_6400.json"` 自动识别 BPE 模型。
+
+### 迁移中修掉的四个 bug（都有实测教训）
+
+1. **BPE 词表 id 分配错误**：`vocab[a+b] = len(vocab) + i` 里 len 每轮在涨，
+   最后一轮 id 到 10745，超出 6400 词表 → embedding 层 IndexError。
+   改成 `base + i`（base 在循环外固定）。
+2. **collate 的 block 没对齐**：pad 到 BLOCK(256) 而 model block_size 是 255，
+   positions 越界。collate 必须用 `block_size - 1`。
+3. **`'\n'` 在 BPE 词表里是 id 0**：`get('\n', 0)` 返回 0 而 0 是真实 token，
+   stop_ids={0} 把生成立即掐断（表现为"生成为空"）。BPE 模式改用
+   解码后按字符截断，不用 stop_ids。
+4. **state loss 梯度冲垮 encoder**（v3 时踩过）：状态头必须 `z.detach()`。
+
+### 诚实的结论：BPE 是效率杠杆，不是质量杠杆
+
+全链路 A/B（同一批手写语料 59 万字符）：
+
+| | 词表 | 预训练 | 生成质量 |
+|---|---|---|---|
+| char-level（lm_final2 系） | 4997 字符 | 2040 万字符工业语料 | 可用（生产配置） |
+| BPE（lm_bpe_sft2） | 6400 子词 | 59 万字符手写语料 ×40ep | **乱码/重复** |
+
+BPE 的压缩率优势是真的（2.22 字符/token，上下文 token 省 55%），
+但 59 万字符手写语料喂 26M BPE 模型只能"背诵"不能泛化——
+SFT loss 0.07 很低，prompt 稍变就崩。**BPE 要发挥价值需要工业语料规模**：
+
+```bash
+# 重训配方（需要 ~2.5 小时）
+python download_corpus.py && python build_final_corpus.py   # 2040 万字符（~30 分钟）
+python bpe_tokenizer.py --train --corpus <工业语料>         # 在工业语料上训 BPE
+python train_bpe.py --epochs 3 --d-model 768 --n-layers 16  # 104M（MiniMind2 配置）
+python train_sft.py --bpe bpe_6400.json --data sft_data_big.jsonl
+```
+
+生产配置保持 char-level 系列（已验证可用），BPE 链路作为就绪的备选架构。
+这就是"先修架构再扩规模"的落点：**架构今天修完了（链路+四个 bug），
+规模是下一步的事（数据先行）**。
+
 ## 对照 MiniMind：SFT 阶段落地（jingyaogong/minimind）
 
 参考 [MiniMind](https://github.com/jingyaogong/minimind) 的训练流水线，

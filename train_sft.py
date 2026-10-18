@@ -29,14 +29,19 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tinygpt import TinyGPT, count_params
+from tokenizer import load_tokenizer
 
 IGNORE = -100  # loss mask 的忽略值
 
 
 class SFTDataset(Dataset):
-    """conversations JSONL → (ids, learn_flags)，只有 assistant 段计入 loss。"""
+    """conversations JSONL → (ids, learn_flags)，只有 assistant 段计入 loss。
 
-    def __init__(self, path, stoi, block_size):
+    BPE 模式：tok 非空时用 tok.encode（子词编码），否则字符级。
+    """
+
+    def __init__(self, path, stoi, block_size, tok=None):
+        self.tok = tok
         self.samples = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -45,8 +50,9 @@ class SFTDataset(Dataset):
                 if sum(learn) >= 2:
                     self.samples.append((ids, learn))
 
-    @staticmethod
-    def _enc(s, stoi):
+    def _enc(self, s, stoi):
+        if self.tok is not None:
+            return self.tok.encode(s)
         return [stoi[c] for c in s if c in stoi]
 
     def _encode(self, conv, stoi, block):
@@ -128,30 +134,51 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument("--block-size", type=int, default=512)
+    parser.add_argument("--bpe", type=str, default="bpe_6400.json",
+                        help="BPE 词表路径；空串 = 字符级（旧行为）")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # tokenizer：BPE（新）或字符级（旧）。BPE 下 tokenizer 自带词表，
+    # resume 的 stoi 只用于 warm start 的 shape 匹配。
+    tok = load_tokenizer(args.bpe) if args.bpe else None
+    stoi = tok.bpe.vocab if tok is not None else None
+
     ck = torch.load(args.resume, map_location="cpu")
-    stoi, itos, state = ck["stoi"], ck["itos"], ck["model"]
+    ck_stoi, ck_itos, state = ck["stoi"], ck["itos"], ck["model"]
     base_cfg = ck["config"]
 
-    ds = SFTDataset(args.data, stoi, args.block_size)
+    # SFTDataset 用 tokenizer 接口（BPE 或 char 都走 encode）
+    class _Enc:
+        def __init__(self, tok, stoi):
+            self.tok = tok
+            self.stoi = stoi
+        def __getitem__(self, s):
+            if self.tok is not None:
+                return None  # BPE 路径不走 dict
+            return self.stoi.get(s, None)
+        def get(self, s, default=None):
+            return self.stoi.get(s, default) if self.stoi else default
+
+    enc = _Enc(tok, ck_stoi)
+    ds = SFTDataset(args.data, enc, args.block_size, tok=tok)
     n_learn = sum(sum(l) for _, l in ds.samples)
     n_total = sum(len(i) for i, _ in ds.samples)
     print(f"sft samples: {len(ds)}, learnable tokens: {n_learn}/{n_total} "
           f"({n_learn / max(1, n_total) * 100:.1f}% —— 续训模式下这部分是 100%)")
 
-    pad_id = stoi.get(" ", stoi.get("\n", 0))
+    pad_id = tok.eot_id if tok is not None else (ck_stoi.get(" ", ck_stoi.get("\n", 0)))
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                    collate_fn=lambda b: collate(b, args.block_size, pad_id))
+                    collate_fn=lambda b: collate(b, args.block_size - 1, pad_id))
 
-    model = TinyGPT(vocab_size=len(stoi), d_model=base_cfg["d_model"],
+    vocab_n = tok.vocab_size if tok is not None else len(ck_stoi)
+    model = TinyGPT(vocab_size=vocab_n, d_model=base_cfg["d_model"],
                     n_heads=base_cfg["n_heads"], n_layers=base_cfg["n_layers"],
-                    block_size=args.block_size,
+                    block_size=args.block_size - 1,
                     state_dim=base_cfg.get("state_dim", 0),
                     state_token_id=base_cfg.get("state_token_id"))
     new_state = model.state_dict()
@@ -207,10 +234,11 @@ def main():
             best = avg
             torch.save({
                 "model": model.state_dict(),
-                "stoi": stoi,
-                "itos": itos,
+                "stoi": tok.bpe.vocab if tok is not None else ck_stoi,
+                "itos": None,   # BPE 模式 decode 靠 bpe.vocab（config 里记 tokenizer 路径）
                 "opt": opt.state_dict(),       # MiniMind 式：优化器状态也存
-                "config": {**base_cfg, "block_size": args.block_size},
+                "config": {**base_cfg, "block_size": args.block_size - 1,
+                           "tokenizer": args.bpe or "char"},
             }, args.out)
     print(f"done. best {best:.4f} -> {args.out}")
 
