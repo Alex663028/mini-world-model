@@ -3,6 +3,7 @@
 *.txt
 *.jsonl
 *.json
+*.npy
 !requirements.txt
 
 # ===== 缓存与临时 =====

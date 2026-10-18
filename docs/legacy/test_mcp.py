@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-PYTHON = "H:/ComfyUI_rocm/python_env/python.exe"
+PYTHON = sys.executable  # 用当前解释器，跨平台
 SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
 
 

@@ -4,16 +4,22 @@
   1. 一步预测：obs_t + a_t -> 想象 obs_{t+1}，和真实下一帧对比
   2. 开环想象 rollout：完全不碰环境，用动力学迭代 30 步，
      把想象的潜状态解码成图，从中提取 agent 位置，对比真实轨迹
-  3. MPC 规划：每步枚举 8 个候选动作方向，用世界模型想象 12 步，
-     谁想象的终点离目标近就执行谁——看智能体能否只靠"想象"导航到目标
+  3. MPC 规划：每步用连续动作候选（瞄准方向 + 邻域 + 采样），
+     用世界模型想象 12 步，谁想象的终点离目标近就执行谁——
+     看智能体能否只靠"想象"导航到目标
 
 用法：python demo.py --ckpt checkpoint.pt
 """
 
 import argparse
+import os
+import sys
 
 import numpy as np
 import torch
+
+# 便携版 / 嵌入式 Python 的 sys.path[0] 可能不是脚本目录，显式补上
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import matplotlib
 
@@ -28,8 +34,14 @@ IMG_SIZE = 64
 
 
 def load_model(ckpt_path):
+    """按形状匹配加载：v1/v2 权重没有 state_head（v3 才加），不能严格 load。"""
     model = MiniWorldModel(latent_dim=LATENT_DIM, action_dim=2)
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+    sd = torch.load(ckpt_path, map_location="cpu")
+    cur = model.state_dict()
+    for k, v in sd.items():
+        if k in cur and cur[k].shape == v.shape:
+            cur[k] = v
+    model.load_state_dict(cur)
     model.eval()
     return model
 
@@ -123,10 +135,26 @@ def main():
         # 持续 2 步运动更连贯（也是真实 MPC 的 standard 做法）
         for _ in range(0, 60, 2):
             z = model.encode(to_tensor(obs2))
-            candidates = [
-                np.array([np.cos(a), np.sin(a)], dtype=np.float32) * 0.7
-                for a in np.linspace(0, 2 * np.pi, 8, endpoint=False)
-            ]
+            # continuous 候选（与 agent.py 一致）：精确瞄准 + ±10°/±20° 邻域 +
+            # 16 个连续采样（方向 × 幅度）+ 惯性 + 减速。
+            # 8 个等分方向的旧版成功率只有 56%——粗粒度会错过最优动作。
+            vec = env2.target - env2.pos
+            dist = float(np.linalg.norm(vec))
+            throttle = float(min(0.7, max(0.3, dist * 1.2)))
+            candidates = []
+            if dist > 1e-6:
+                candidates.append((vec / dist * throttle).astype(np.float32))
+                base_ang = float(np.arctan2(vec[1], vec[0]))
+                for da in (-0.35, -0.17, 0.17, 0.35):
+                    candidates.append(np.array(
+                        [np.cos(base_ang + da), np.sin(base_ang + da)],
+                        dtype=np.float32) * throttle)
+            rng = np.random.default_rng(int(env2.steps * 31))
+            for _ in range(16):
+                ang = rng.uniform(0, 2 * np.pi)
+                mag = throttle * rng.uniform(0.55, 1.15)
+                candidates.append(np.array(
+                    [np.cos(ang), np.sin(ang)], dtype=np.float32) * mag)
             candidates.append(prev_a.copy())                # 惯性候选：延续上一步
             candidates.append(np.zeros(2, dtype=np.float32))  # 减速候选
             best_a, best_d = None, np.inf

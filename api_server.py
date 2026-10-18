@@ -13,7 +13,7 @@
     POST /calc      {"expression": "23 乘以 7"} → 算术
 
 用法：
-    H:/ComfyUI_rocm/python_env/python.exe api_server.py [--port 8399]
+    python api_server.py [--port 8399]
 
 调用示例：
     curl -X POST http://127.0.0.1:8399/reply -H "Content-Type: application/json" -d "{\"text\": \"你看到了什么？\"}"
@@ -85,8 +85,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send({
                 "ok": True,
                 "service": "MiniWorldAgent API",
-                "endpoints": ["/state", "/history", "/reply", "/task", "/perceive",
-                              "/imagine", "/act", "/reset", "/kb", "/calc"],
+                "endpoints": {
+                    "GET  /state": "环境与事件状态",
+                    "GET  /history": "最近 10 轮对话",
+                    "POST /reply": '{"text": "你好"} — 自由对话（路由模式）',
+                    "POST /task": '{"task": "去目标那儿"} — 执行导航任务',
+                    "POST /perceive": '{"question": "你看到了什么？"} — 感知问答',
+                    "POST /imagine": '{"direction": "左"} — 想象一步',
+                    "POST /act": '{"direction": "前"} — 执行动作',
+                    "POST /reset": "重置环境",
+                    "POST /kb": '{"question": "长城是什么"} — 常识检索',
+                    "POST /calc": '{"expression": "23*7"} — 四则运算',
+                },
             })
         else:
             self._send({"ok": False, "error": f"unknown path {self.path}"}, 404)

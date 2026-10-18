@@ -1,7 +1,7 @@
 """大语言模型训练：GPU（ROCm）优先，混合精度，梯度累积。
 
 在 ComfyUI 的 ROCm python 环境上运行（该环境已带可用的 torch ROCm）：
-    H:/ComfyUI_rocm/python_env/python.exe train_lm_big.py
+    python train_lm_big.py
 
 RDNA2 注意：禁用 flash SDP，走 math attention（RDNA2 上 flash 路径有已知问题）。
 """

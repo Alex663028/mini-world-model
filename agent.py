@@ -83,7 +83,10 @@ CONFIG = {
     "mpc_candidates": "continuous",  # "fixed8"（v1）或 "continuous"（v2）
     "mpc_samples": 16,        # continuous 模式的随机采样数
     "aim_horizon": 24,        # 想象窗口（实验用，v1 是 12）
-    "use_state_head": True,   # 用状态头推演（比 decode+argmax 快 10 倍、更准）
+    # 状态头推演：比 decode+argmax 快 10 倍，但位置精度差 10 倍
+    # （RMSE 0.178 vs 像素 1/64≈0.016）。实测导航 5/8 vs 7/8（同 v3 权重），
+    # 所以默认关闭——只有显式传入 use_state_head=True 才走状态头。
+    "use_state_head": False,
 }
 
 # 各类意图的关键词路由（按优先级排列，具体词优先于宽泛词）
@@ -168,8 +171,21 @@ class MiniWorldAgent:
         self.dz_scale = 1.0  # Δz 缩放（LM config 会覆盖为训练时的值）
 
         # ---- 感知层：世界模型 ----
+        # 世界模型是 agent 的根基（没有它就没法感知/规划），缺失时给出明确指引
+        # 而不是一堆 traceback——这是开源体验的底线。
+        if not os.path.exists(world_ckpt):
+            sys.stderr.write(
+                f"[agent] 找不到世界模型权重：{world_ckpt}\n"
+                f"        先训练一个（CPU 约 4 分钟）：\n"
+                f"            python train.py --episodes 400 --epochs 20\n"
+            )
+            raise SystemExit(1)
         self.model = MiniWorldModel(latent_dim=32, action_dim=2)
-        sd = torch.load(world_ckpt, map_location=self.device)
+        try:
+            sd = torch.load(world_ckpt, map_location=self.device)
+        except Exception as e:
+            sys.stderr.write(f"[agent] 世界模型权重加载失败（{world_ckpt}）：{e}\n")
+            raise SystemExit(1)
         cur = self.model.state_dict()
         inherited = 0
         for k, v in sd.items():

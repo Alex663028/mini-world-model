@@ -13,11 +13,15 @@
 
 import argparse
 import os
+import sys
 import time
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+
+# 便携版 / 嵌入式 Python 的 sys.path[0] 可能不是脚本目录，显式补上
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from env import PointMassEnv, collect_rollouts
 from model import MiniWorldModel, count_params

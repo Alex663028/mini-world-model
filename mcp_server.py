@@ -16,7 +16,7 @@
     calc            符号计算器
 
 运行（stdio 模式，由 MCP 客户端拉起）：
-    H:/ComfyUI_rocm/python_env/python.exe mcp_server.py
+    python mcp_server.py
 """
 
 import os

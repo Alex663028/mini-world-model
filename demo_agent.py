@@ -8,8 +8,8 @@
   5. 闲聊（语言生成）
 
 用法：
-    H:/ComfyUI_rocm/python_env/python.exe demo_agent.py
-    H:/ComfyUI_rocm/python_env/python.exe demo_agent.py --interactive
+    python demo_agent.py
+    python demo_agent.py --interactive
 """
 
 import os
@@ -55,7 +55,7 @@ def main():
         print(f"小WM: {bot.reply(q)}")
 
     print("\n" + "=" * 58)
-    print("交互模式: H:/ComfyUI_rocm/python_env/python.exe demo_agent.py --interactive")
+    print("交互模式: python demo_agent.py --interactive")
 
 
 if __name__ == "__main__":
