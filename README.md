@@ -6,6 +6,8 @@
 
 **从零训练的世界模型 × 语言模型 × 具身 Agent —— 单卡可复现的完整闭环**
 
+[English](README.en.md) · 中文 · [技术日志](docs/ARCHIVE.md)
+
 > 不想训练？[直接下载预训练权重](https://github.com/Alex663028/mini-world-model/releases/tag/v0.1.0)（790 MB），解压到根目录即可对话。
 
 一个 6.7K 行、纯 PyTorch 实现的最小具身智能系统：像素感知 → 潜空间动力学 → MPC 规划 → 动作执行 → 事件记忆 → 语言交互。
