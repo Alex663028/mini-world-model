@@ -1,0 +1,12 @@
+# 统一换行符为 LF（消除 CRLF 警告，跨平台一致）
+* text=auto eol=lf
+
+# 二进制文件不做换行转换与 diff
+*.pt binary
+*.png binary
+*.npy binary
+
+# 文档/数据按文本处理
+*.md text
+*.py text
+*.json text

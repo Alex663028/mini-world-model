@@ -24,12 +24,13 @@
 用法：python bench_probe.py
 """
 
+import os
 import sys
 import time
 
 import torch
 
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tinygpt import TinyGPT, count_params
 
 BLOCK = 256  # 与 train_bpe.py 对齐（BPE token 上下文）
