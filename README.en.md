@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/Alex663028/mini-world-model)](https://github.com/Alex663028/mini-world-model/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)](tests/)
+[![Tests](https://github.com/Alex663028/mini-world-model/actions/workflows/tests.yml/badge.svg)](https://github.com/Alex663028/mini-world-model/actions/workflows/tests.yml)
 
 **World model × language model × embodied agent — a complete closed loop, reproducible on a single GPU.**
 

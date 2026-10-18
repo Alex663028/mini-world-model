@@ -3,6 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/Alex663028/mini-world-model)](https://github.com/Alex663028/mini-world-model/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![tests](https://github.com/Alex663028/mini-world-model/actions/workflows/tests.yml/badge.svg)](https://github.com/Alex663028/mini-world-model/actions/workflows/tests.yml)
 
 **从零训练的世界模型 × 语言模型 × 具身 Agent —— 单卡可复现的完整闭环**
 
