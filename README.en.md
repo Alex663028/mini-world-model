@@ -42,44 +42,31 @@ Useful if you:
 
 ## Architecture
 
-```
-PointMassEnv  (64×64 grayscale, 2-D acceleration actions)
-        │
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  ① World model (~1.5M params, CNN + MLP)                │
-│     obs ──Encoder CNN──> z_t (32-D latent)              │
-│     action a_t ───────> Dynamics MLP ──> ẑ_{t+1}        │
-│              ┌───────────┴───────────┐                  │
-│              ▼                       ▼                  │
-│        Decoder CNN              State Head (v3 exp.)    │
-│        imagined frame           z → pos/vel/dist        │
-└─────────────────────────────────────────────────────────┘
-        │ z_t
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  ② Planning & control                                   │
-│     MPC (12-step imagination) ──> action ──> PD control  │
-│     Candidates: exact aim + ±10°/±20° neighbors + 16 samples │
-└─────────────────────────────────────────────────────────┘
-        │ execution + events
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  ③ Agent layer (agent.py, single entry)                 │
-│     WorldState: pos/vel/target/distance + event stream   │
-│     Events: reached / bumped / failed / timeout         │
-│     Tools: world_perceive / world_navigate / world_act   │
-│            world_imagine / kb_query / calc              │
-│     Remote tools: register_http_tool() → any HTTP endpoint │
-└─────────────────────────────────────────────────────────┘
-        │ z_t injected at [STATE] token
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  ④ Language model (char 77.5M / BPE 123.4M, from scratch) │
-│     Perception QA: latent injection → "target is north, 0.7 away" │
-│     Chat/knowledge: 4-layer fallback (table → retrieve → generate → say "I don't know") │
-│     Tool calls: [调用工具 world_act, direction=西北]      │
-└─────────────────────────────────────────────────────────┘
+```text
+PointMassEnv  (64x64 grayscale, 2-D acceleration actions)
+│
+├── [1] World model  ~1.5M params (CNN + MLP)
+│         obs  ──Encoder CNN──> z_t (32-D latent)
+│         a_t  ──Dynamics MLP──> ẑ_{t+1}
+│                        ├──> Decoder CNN   → imagined frame
+│                        └──> State Head    → pos/vel/dist (v3 exp.)
+│
+├── [2] Planning & control
+│         MPC (12-step imagination) ──> action ──> PD control
+│         Candidates: exact aim + ±10°/±20° neighbors + 16 samples
+│
+├── [3] Agent layer (agent.py, single entry)
+│         WorldState: pos / vel / target / distance + event stream
+│         Events: reached / bumped / failed / timeout
+│         Tools: world_perceive / world_navigate / world_act
+│                world_imagine / kb_query / calc
+│         Remote tools: register_http_tool() → any HTTP endpoint
+│
+└── [4] Language model  char 77.5M / BPE 123.4M (from scratch)
+          ↑ z_t injected at [STATE] token
+          Perception QA: "target is north, distance 0.7"
+          Chat/knowledge: 4-layer fallback (table → retrieve → generate → "I don't know")
+          Tool calls: [调用工具 world_act, direction=西北]
 ```
 
 Three interfaces: **CLI / HTTP API / MCP Server**.
