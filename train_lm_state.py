@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tinygpt import TinyGPT, count_params
+from tokenizer import load_tokenizer
 
 STATE_TOKEN = "\uE000"
 BLOCK = 96
@@ -34,23 +35,33 @@ def load_resume(path):
     return ck["stoi"], ck["itos"], ck["model"]
 
 
-def build_state_samples(path, stoi):
-    """state QA：每条样本 (input, target, state)。state 维度自动探测。"""
+def build_state_samples(path, stoi, tok=None, block=512, state_dim=None):
+    """state QA：每条样本 (input, target, state)。
+
+    tok 非空时用 BPE 编码；state_dim 非空时从 state 截取前 N 维
+    （64 维数据取前 32 = 纯 z，丢弃 Δz 部分）。
+    """
     xs, ys, states = [], [], []
-    space = stoi[" "]
+    space = tok.eot_id if tok is not None else stoi[" "]
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
-            ids = [stoi[c] for c in obj["text"] if c in stoi]
+            if tok is not None:
+                ids = tok.encode(obj["text"])
+            else:
+                ids = [stoi[c] for c in obj["text"] if c in stoi]
             if len(ids) < 8:
                 continue
-            ids = ids[:BLOCK]
+            ids = ids[:block]
             inp, tgt = ids[:-1], ids[1:]
-            inp = inp + [space] * (BLOCK - 1 - len(inp))
-            tgt = tgt + [space] * (BLOCK - 1 - len(tgt))
+            inp = inp + [space] * (block - 1 - len(inp))
+            tgt = tgt + [space] * (block - 1 - len(tgt))
+            st = obj["state"]
+            if state_dim:
+                st = st[:state_dim]
             xs.append(inp)
             ys.append(tgt)
-            states.append(obj["state"])
+            states.append(st)
     return xs, ys, states
 
 
@@ -88,22 +99,49 @@ def main():
     parser.add_argument("--plain-budget", type=float, default=2.7, help="普通语料字符预算（百万）")
     parser.add_argument("--repeat", type=int, default=1, help="普通语料重复次数（小语料扩量用）")
     parser.add_argument("--out", type=str, default="lm_state_motion.pt")
+    parser.add_argument("--bpe", type=str, default=None, help="BPE 词表路径（BPE 模式）")
+    parser.add_argument("--state-dim", type=int, default=None, help="state 截取维度（64 维取 32）")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="数据序列长度（默认用模型 block_size；state QA 文本短，"
+                             "截到 128 可省 16 倍 attention 算力）")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. 词表（继承 + 追加 [STATE] token）
-    stoi, itos, old_state = load_resume(args.resume)
-    if STATE_TOKEN not in stoi:
-        stoi[STATE_TOKEN] = len(stoi)
-        itos[len(itos)] = STATE_TOKEN
-    state_token_id = stoi[STATE_TOKEN]
-    print(f"vocab: {len(stoi)} (state token id = {state_token_id})")
+    # 1. 词表：BPE 模式从词表文件 + 特殊 token；char 模式继承 + 追加
+    bpe_tok = load_tokenizer(args.bpe) if args.bpe else None
+    old_state = None
+    if bpe_tok is not None:
+        stoi = bpe_tok.bpe.vocab
+        itos = None
+        if STATE_TOKEN not in stoi:
+            stoi[STATE_TOKEN] = len(stoi)
+            bpe_tok.specials[STATE_TOKEN] = stoi[STATE_TOKEN]
+        state_token_id = stoi[STATE_TOKEN]
+        ck_bpe = torch.load(args.resume, map_location="cpu")  # warm start 源
+        old_state = ck_bpe["model"]
+        ck_cfg = ck_bpe["config"]
+        print(f"BPE vocab: {len(stoi)} (state token id = {state_token_id}, block {ck_cfg['block_size']})")
+    else:
+        stoi, itos, old_state = load_resume(args.resume)
+        if STATE_TOKEN not in stoi:
+            stoi[STATE_TOKEN] = len(stoi)
+            itos[len(itos)] = STATE_TOKEN
+        state_token_id = stoi[STATE_TOKEN]
+        print(f"vocab: {len(stoi)} (state token id = {state_token_id})")
 
     # 2. 数据（state 维度从数据探测；无 state 数据时 state_dim=0 训纯文本模型）
-    sx, sy, ss = build_state_samples(args.state_data, stoi) if args.state_data else ([], [], [])
+    # block 必须与模型 block_size 一致：BPE 用 ck_cfg（255/511），char 用 BLOCK-1（95）。
+    # 踩坑：不传 block 时默认 512 → 序列 pad 到 511 → BPE 模型 position 越界
+    # 优化：state QA 文本短（≤80 token），--seq-len 截到 128 省 16 倍 attention
+    blk = ck_cfg["block_size"] if bpe_tok is not None else BLOCK - 1
+    if args.seq_len:
+        blk = min(blk, args.seq_len)
+    sx, sy, ss = (build_state_samples(args.state_data, stoi, tok=bpe_tok,
+                                      block=blk, state_dim=args.state_dim)
+                  if args.state_data else ([], [], []))
     state_dim = len(ss[0]) if ss else 0
     # Δz 缩放系数（gen_state_data 落盘，存进 config 供推理端保持一致）
     dz_scale = 1.0
@@ -120,10 +158,15 @@ def main():
     states = torch.tensor(ss + ps, dtype=torch.float32)
     dl = DataLoader(TensorDataset(xs, ys, states), batch_size=args.batch_size, shuffle=True)
 
-    # 3. 模型（large 配置 + 探测到的 state_dim）
+    # 3. 模型：BPE 模式用 lm_bpe_big_sft 的 768/16 层配置；char 模式用 large 配置
+    if bpe_tok is not None:
+        d_model, n_heads, n_layers, block = (ck_cfg["d_model"], ck_cfg["n_heads"],
+                                             ck_cfg["n_layers"], ck_cfg["block_size"])
+    else:
+        d_model, n_heads, n_layers, block = 640, 10, 14, BLOCK - 1
     model = TinyGPT(
         vocab_size=len(stoi),
-        d_model=640, n_heads=10, n_layers=14, block_size=BLOCK - 1,
+        d_model=d_model, n_heads=n_heads, n_layers=n_layers, block_size=block,
         state_dim=state_dim, state_token_id=state_token_id,
     )
     # 4. warm start：词表增长时复制旧行
@@ -176,9 +219,11 @@ def main():
                     "stoi": stoi,
                     "itos": itos,
                     "config": {
-                        "block_size": BLOCK - 1, "d_model": 640, "n_heads": 10,
-                        "n_layers": 14, "state_dim": state_dim, "state_token_id": state_token_id,
+                        "block_size": block, "d_model": d_model, "n_heads": n_heads,
+                        "n_layers": n_layers, "state_dim": state_dim,
+                        "state_token_id": state_token_id,
                         "dz_scale": dz_scale,
+                        "tokenizer": args.bpe or "char",
                     },
                 },
                 args.out,

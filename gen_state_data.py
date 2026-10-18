@@ -180,7 +180,12 @@ def main():
     args = parser.parse_args()
 
     model = MiniWorldModel(latent_dim=32, action_dim=2)
-    model.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
+    sd = torch.load(args.ckpt, map_location="cpu")
+    cur = model.state_dict()
+    for k, v in sd.items():
+        if k in cur and cur[k].shape == v.shape:
+            cur[k] = v
+    model.load_state_dict(cur)  # 按形状匹配：v1 权重没有 state_head
     model.eval()
 
     half = args.episodes // 2

@@ -1,0 +1,8 @@
+# 世界模型 + demo 可视化（CPU 即可）
+numpy>=1.24
+matplotlib>=3.7
+
+# 语言模型训练与推理（GPU 建议，CPU 也能跑但慢）
+# CPU 版：https://download.pytorch.org/whl/cpu
+# ROCm 版：https://download.pytorch.org/whl/rocm6.2
+torch>=2.2
