@@ -16,13 +16,19 @@
     具身查询是两者的桥梁。这正是在地机器人 / 具身智能的标准架构。
 
 无外部依赖：中文匹配用字符 bigram 重叠，不需要分词库。
+
+⚠️ 废弃说明：本文件的 ChatEngine 已被 agent.MiniWorldAgent 完全取代
+（agent.py 只从本模块 import bigrams / extract_agent_pos）。保留它只是为了
+不打断任何外部 import；新代码不要再用 ChatEngine。
 """
 
 import re
+import warnings
 
 import numpy as np
 import torch
 
+from env import ACTION_GAIN, DAMPING
 from knowledge import ALL_KNOWLEDGE, FALLBACKS, SMALLTALK
 
 
@@ -69,7 +75,13 @@ def bigrams(text):
 
 
 class ChatEngine:
-    """对话引擎：常识问答 + 计算 + 世界模型具身查询。"""
+    """对话引擎：常识问答 + 计算 + 世界模型具身查询。
+
+    .. deprecated::
+        已废弃：v2 起统一入口是 ``agent.MiniWorldAgent``（能力是它的超集，
+        且带事件记忆/MPC 连续候选）。本类全仓无调用方，仅为兼容保留；
+        实例化会发 DeprecationWarning。
+    """
 
     # 世界模型查询路由表（子串命中，按优先级排列）
     WORLD_PATTERNS = [
@@ -99,12 +111,16 @@ class ChatEngine:
     ]
 
     def __init__(self, model=None, env=None, ckpt="checkpoint.pt"):
+        warnings.warn(
+            "ChatEngine 已废弃，请改用 agent.MiniWorldAgent",
+            DeprecationWarning, stacklevel=2,
+        )
         from env import PointMassEnv
         from model import MiniWorldModel
 
         if model is None:
             self.model = MiniWorldModel(latent_dim=32, action_dim=2)
-            self.model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+            self.model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
             self.model.eval()
         else:
             self.model = model
@@ -300,7 +316,7 @@ class ChatEngine:
                     n = np.linalg.norm(vec)
                     if n > 1e-6:
                         desired_v = vec / n * min(0.3, n * 1.2)
-                        a_ctrl = (desired_v - 0.8 * self.env.vel) / 0.12
+                        a_ctrl = (desired_v - DAMPING * self.env.vel) / ACTION_GAIN
                         best_a = np.clip(a_ctrl, -0.9, 0.9).astype(np.float32)
                     else:
                         best_a = np.zeros(2, dtype=np.float32)

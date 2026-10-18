@@ -31,7 +31,7 @@ BLOCK = 96
 
 
 def load_resume(path):
-    ck = torch.load(path, map_location="cpu")
+    ck = torch.load(path, map_location="cpu", weights_only=True)
     return ck["stoi"], ck["itos"], ck["model"]
 
 
@@ -120,7 +120,7 @@ def main():
             stoi[STATE_TOKEN] = len(stoi)
             bpe_tok.specials[STATE_TOKEN] = stoi[STATE_TOKEN]
         state_token_id = stoi[STATE_TOKEN]
-        ck_bpe = torch.load(args.resume, map_location="cpu")  # warm start 源
+        ck_bpe = torch.load(args.resume, map_location="cpu", weights_only=True)  # warm start 源
         old_state = ck_bpe["model"]
         ck_cfg = ck_bpe["config"]
         print(f"BPE vocab: {len(stoi)} (state token id = {state_token_id}, block {ck_cfg['block_size']})")

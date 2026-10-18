@@ -1,0 +1,70 @@
+# 打包 / 工具配置。
+# 说明：仓库是"平铺脚本集合"（36 个顶层模块，无包目录），所以用 py-modules
+# 显式列清单，别让 setuptools 自动发现猜错。
+# 依赖安装两种方式等价：pip install -r requirements.txt（推荐，CPU/ROCm 需自选
+# torch 源）或 pip install -e .（含 pyproject 里声明的依赖）。
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-world-model"
+version = "1.0.0"
+description = "迷你世界模型 + 具身 agent：世界模型 / 语言模型 / MPC 规划全链路（CPU 可跑）"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Alex663028" }]
+keywords = ["world-model", "agent", "mpc", "tinygpt", "bpe"]
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+corpus = ["pyarrow>=14.0"]   # download_corpus.py 读 parquet
+mcp = ["mcp>=1.0"]           # mcp_server.py
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+py-modules = [
+    "agent",
+    "api_server",
+    "bench_probe",
+    "bpe_tokenizer",
+    "build_final_corpus",
+    "chat",
+    "corpus",
+    "corpus_big",
+    "corpus_dialog",
+    "corpus_mixed",
+    "corpus_sft",
+    "demo",
+    "demo_agent",
+    "download_corpus",
+    "env",
+    "eval_planner",
+    "eval_world",
+    "gen_state_data",
+    "history_geo_big",
+    "knowledge",
+    "life_big",
+    "mcp_server",
+    "model",
+    "science_big",
+    "tech_big",
+    "tinygpt",
+    "tokenize_corpus",
+    "tokenizer",
+    "train",
+    "train_bpe",
+    "train_lm_big",
+    "train_lm_state",
+    "train_sft",
+    "train_world_v2",
+    "train_world_v3",
+    "verify_state_bpe",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

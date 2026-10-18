@@ -10,9 +10,19 @@ BPE 把高频字/词合并成一个 token，等于免费扩容上下文。
   3. 达到目标词表大小时停止
   4. 编码时按 merges 顺序贪心合并
 
+OOV（词表外字符）策略：
+    编码时遇到词表外字符，**绝不静默映射成 id 0**。id 0 在词表里是 "\n"，
+    把 emoji / 生僻字替换成 0 等于往训练数据里注入假换行——实测
+    encode('你好😀世界𠮷') → [392, 1014, 0, 4250, 0]，decode 回来是
+    "你好\\n世界\\n"，lossless=False，而且没有任何报错。
+    现在的行为：默认**丢弃并计数**（与 CharTokenizer 的字符级语义一致），
+    需要严格模式时调用 BPE.encode(text, strict=True)，遇到 OOV 直接抛
+    OOVError；训练前可以用 --check 统计语料的 OOV 丢弃率再决定是否清洗语料。
+
 用法：
     python bpe_tokenizer.py --train --vocab-size 6400 --out bpe_6400.json
     python bpe_tokenizer.py --bench      # 测中文压缩率
+    python bpe_tokenizer.py --check --corpus corpus_mixed.txt  # OOV 丢弃率
 """
 
 import argparse
@@ -25,12 +35,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 SPECIALS = ["\n", " ", "：", "？", "！", "，", "。"]
 
+# 语料少于这个长度就拒绝训练：否则会静默产出空词表（vocab 0 + merges 0）、
+# 写一个看起来正常的 json 然后 exit 0——用户要到训练时才发现词表是空的。
+MIN_CORPUS_CHARS = 200
+
+
+class OOVError(ValueError):
+    """严格模式下遇到词表外字符（OOV）时抛出。"""
+
+    def __init__(self, chars):
+        self.chars = list(chars)
+        shown = "、".join(f"{c!a}" for c in self.chars[:10])
+        super().__init__(
+            f"发现 {len(self.chars)} 个词表外字符（OOV）：{shown}"
+            + ("…" if len(self.chars) > 10 else "")
+            + "；请清洗语料或改用非严格模式（OOV 字符会被丢弃并计数）"
+        )
+
 
 def load_corpus(paths):
     """合并多个语料文件（jsonl 会自动抽出 text/conversations 字段）。"""
     parts = []
+    missing = []
     for p in paths:
         if not os.path.exists(p):
+            missing.append(p)
             continue
         with open(p, "r", encoding="utf-8") as f:
             if p.endswith(".jsonl"):
@@ -42,6 +71,9 @@ def load_corpus(paths):
                         parts.append(obj["text"])
             else:
                 parts.append(f.read())
+    if missing:
+        print(f"[warn] 语料文件不存在，已跳过 {len(missing)} 个：{', '.join(missing)}",
+              file=sys.stderr)
     return "".join(parts)
 
 
@@ -52,6 +84,8 @@ def train_bpe_fast(text, vocab_size=6400, report_every=500):
     300 万字符：全扫描版 10 分钟+，增量版几秒——词表训练是基础工具，
     这个优化决定了"在工业语料上训词表"可不可行。
     """
+    if not text:
+        raise ValueError("语料为空，无法训练 BPE 词表")
     from collections import defaultdict
     from heapq import heapify, heappop, heappush
 
@@ -136,7 +170,12 @@ def train_bpe(text, vocab_size=6400):
     实现：整个文本是一个符号序列，每轮统计最高频相邻符号对并合并。
     注意 words 必须按"序列"而非"字符"计数——第一版写成 Counter(list(text))
     导致键是单个字符、len-1 循环不执行、merges 直接为 0（实测踩过）。
+
+    空语料直接抛 ValueError：静默返回空词表比报错危险得多
+    （train 会写出一个 vocab 0 + merges 0 的 json 并 exit 0）。
     """
+    if not text:
+        raise ValueError("语料为空，无法训练 BPE 词表")
     if len(text) > 500_000:
         return train_bpe_fast(text, vocab_size)
     # 小文本用简单版（代码更直观）
@@ -176,26 +215,54 @@ def train_bpe(text, vocab_size=6400):
 
 
 class BPE:
-    """BPE 编解码器（加载 merges/vocab 后使用）。"""
+    """BPE 编解码器（加载 merges/vocab 后使用）。
 
-    def __init__(self, merges, vocab):
+    OOV（词表外字符）处理——这里是踩过的坑：encode 曾经写成
+    ``self.vocab.get(s, 0)``，把词表外字符静默映射成 id 0，而本项目的
+    bpe_6400 词表里 id 0 恰好是 "\\n"。后果是训练数据里凭空多出换行、
+    decode 不再无损，且毫无提示。
+    现在：
+      - 默认（unk_id=None, strict=False）：丢弃 OOV 并计数
+        （oov_total / oov_chars），与 CharTokenizer 的字符级行为一致；
+      - strict=True：抛 OOVError；
+      - unk_id=N：映射到预留的 UNK id（仅当词表确实留了位置时用）。
+    """
+
+    def __init__(self, merges, vocab, unk_id=None):
         self.merges = merges
         self.vocab = vocab
         self.rank = {pair: i for i, pair in enumerate(merges)}
+        self.unk_id = unk_id
+        self.oov_total = 0          # 累计被丢弃 / 映射到 UNK 的字符数
+        self.oov_chars = Counter()  # 字符 -> 出现次数（用于清洗语料）
+        self.encoded_chars = 0      # 累计编出的 token 数（算 OOV 丢弃率用）
 
-    def encode(self, text, chunk=4000):
+    def reset_oov_stats(self):
+        self.oov_total = 0
+        self.oov_chars.clear()
+        self.encoded_chars = 0
+
+    @property
+    def oov_rate(self):
+        """已统计的 OOV 丢弃率（编码前先 reset_oov_stats）。"""
+        total = self.oov_total + self.encoded_chars
+        return self.oov_total / total if total else 0.0
+
+    def encode(self, text, chunk=4000, strict=False):
         """BPE 编码。长文本分块处理（每块独立编码，块间不跨 merge）——
         全文本单次 encode 是 O(n × merges) 扫描，3000 万字符要几分钟；
         分块后 4000 字符一块，几秒完成（真实 BPE 也是先 pretokenize 分块）。
+
+        strict=True 时遇到任何词表外字符抛 OOVError（不产出半截 ids）。
         """
         if len(text) <= chunk:
-            return self._encode_chunk(text)
+            return self._encode_chunk(text, strict=strict)
         out = []
         for i in range(0, len(text), chunk):
-            out.extend(self._encode_chunk(text[i : i + chunk]))
+            out.extend(self._encode_chunk(text[i : i + chunk], strict=strict))
         return out
 
-    def _encode_chunk(self, text):
+    def _encode_chunk(self, text, strict=False):
         symbols = list(text)
         while True:
             best, best_rank = None, None
@@ -214,7 +281,23 @@ class BPE:
                     out.append(symbols[i])
                     i += 1
             symbols = out
-        return [self.vocab.get(s, 0) for s in symbols]
+        ids, missing = [], []
+        for s in symbols:
+            i = self.vocab.get(s)
+            if i is not None:
+                ids.append(i)
+            elif strict:
+                missing.append(s)
+            else:
+                # 词表外字符：丢弃 + 计数；有预留 UNK 位时才映射
+                self.oov_total += 1
+                self.oov_chars[s] += 1
+                if self.unk_id is not None:
+                    ids.append(self.unk_id)
+        if missing:
+            raise OOVError(missing)
+        self.encoded_chars += len(ids)
+        return ids
 
     def decode(self, ids):
         inv = {v: k for k, v in self.vocab.items()}
@@ -225,8 +308,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--check", action="store_true",
+                        help="用 --out 词表统计 --corpus 的 OOV 丢弃率（不训练）")
     parser.add_argument("--vocab-size", type=int, default=6400)
     parser.add_argument("--out", type=str, default="bpe_6400.json")
+    parser.add_argument("--min-chars", type=int, default=MIN_CORPUS_CHARS,
+                        help="语料下限，低于此长度直接报错（默认 200）")
     parser.add_argument("--corpus", nargs="*", default=[
         "corpus_mixed.txt", "corpus_dialog.txt", "sft_data_big.jsonl"])
     args = parser.parse_args()
@@ -234,11 +321,46 @@ def main():
     if args.train:
         text = load_corpus(args.corpus)
         print(f"corpus: {len(text)} chars")
+        # 空/极短语料必须报错：以前会静默写出 vocab 0 + merges 0 的 json 并 exit 0
+        if len(text) < args.min_chars:
+            raise SystemExit(
+                f"[bpe] 语料过短（{len(text)} < {args.min_chars} 字符），拒绝训练空词表。\n"
+                f"      检查 --corpus 路径是否正确：{' '.join(args.corpus)}"
+            )
         merges, vocab = train_bpe(text, args.vocab_size)
+        if not merges:
+            raise SystemExit(
+                f"[bpe] 训练产出 0 条 merge（词表 {len(vocab)} 字符）——语料退化，"
+                f"拒绝写出无效词表 {args.out}"
+            )
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump({"merges": [list(p) for p in merges], "vocab": vocab},
                       f, ensure_ascii=False)
         print(f"trained: vocab {len(vocab)} + merges {len(merges)} -> {args.out}")
+
+    if args.check:
+        if not os.path.exists(args.out):
+            raise SystemExit(f"[bpe] 找不到词表 {args.out}，先用 --train 训练")
+        with open(args.out, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bpe = BPE([tuple(p) for p in data["merges"]], data["vocab"])
+        text = load_corpus(args.corpus)
+        if not text:
+            raise SystemExit("[bpe] 语料为空，没有可统计的内容")
+        step = 500_000
+        for i in range(0, len(text), step):
+            bpe.encode(text[i : i + step])
+        print(f"\nOOV 统计（{args.out} vs {len(text)} 字符语料）:")
+        print(f"  词表: {len(bpe.vocab)} 字符 | 编码 token: {bpe.encoded_chars}")
+        print(f"  OOV 丢弃: {bpe.oov_total} 字符（丢弃率 {bpe.oov_rate * 100:.4f}%）")
+        if bpe.oov_chars:
+            top = bpe.oov_chars.most_common(10)
+            # 用 ascii 转义显示：emoji 之类字符在 GBK 控制台直接 print 会 UnicodeEncodeError
+            shown = "、".join(f"{c!a}×{n}" for c, n in top)
+            print(f"  高频 OOV: {shown}")
+            print("  建议：训练前把这些字符从语料里清掉，或确认可接受丢弃率。")
+        else:
+            print("  语料全部在词表覆盖范围内，无丢弃。")
 
     if args.bench and os.path.exists(args.out):
         with open(args.out, "r", encoding="utf-8") as f:

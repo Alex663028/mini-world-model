@@ -24,7 +24,11 @@ SEEDS = [2026, 6100, 31337, 424242, 777, 1024, 555, 8888,
 def run(mode, seeds, horizon=None):
     cfg = {"mpc_candidates": mode}
     if horizon:
-        cfg["aim_horizon"] = horizon
+        # 想象窗口只有 imagine_horizon 这一个开关（agent 全仓只读它）。
+        # 这里原来误写 aim_horizon——全仓没有任何消费方，于是
+        # `--horizons 20` 跑出来的其实是 horizon=12 的重复测量，
+        # "20 步与 12 步效果相同（已饱和）"的结论因此无有效实验支撑。
+        cfg["imagine_horizon"] = horizon
     bot = MiniWorldAgent(config=cfg)
     ok, steps, t0 = 0, [], time.time()
     for s in seeds:

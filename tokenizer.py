@@ -59,6 +59,9 @@ class BPETokenizerAdapter:
 
     特殊 token（[STATE] 的 \uE000）用 BPE 词表之外的独立 id
     （追加到词表末尾），保证和 char 版一样可注入。
+
+    OOV（词表外字符）不会被替换成 id 0（那等于注入假换行）：默认丢弃，
+    统计在 oov_total / oov_chars；strict=True 时抛 OOVError。
     """
 
     def __init__(self, bpe, specials=("\uE000",)):
@@ -67,7 +70,7 @@ class BPETokenizerAdapter:
         self.specials = {s: n_bpe + i for i, s in enumerate(specials)}
         self._inv = None
 
-    def encode(self, text):
+    def encode(self, text, strict=False):
         # 特殊 token 单独处理：文本按特殊 token 切段，BPE 段编码 + 特殊 token id
         out = []
         rest = text
@@ -75,11 +78,26 @@ class BPETokenizerAdapter:
             for s, sid in self.specials.items():
                 if s in rest:
                     head, rest = rest.split(s, 1)
-                    out.extend(self.bpe.encode(head))
+                    out.extend(self.bpe.encode(head, strict=strict))
                     out.append(sid)
                     break
-        out.extend(self.bpe.encode(rest))
+        out.extend(self.bpe.encode(rest, strict=strict))
         return out
+
+    @property
+    def oov_total(self):
+        return self.bpe.oov_total
+
+    @property
+    def oov_chars(self):
+        return dict(self.bpe.oov_chars)
+
+    @property
+    def oov_rate(self):
+        return self.bpe.oov_rate
+
+    def reset_oov_stats(self):
+        self.bpe.reset_oov_stats()
 
     def decode(self, ids):
         if self._inv is None:

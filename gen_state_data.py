@@ -180,7 +180,7 @@ def main():
     args = parser.parse_args()
 
     model = MiniWorldModel(latent_dim=32, action_dim=2)
-    sd = torch.load(args.ckpt, map_location="cpu")
+    sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     cur = model.state_dict()
     for k, v in sd.items():
         if k in cur and cur[k].shape == v.shape:

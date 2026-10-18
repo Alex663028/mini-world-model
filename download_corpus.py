@@ -29,22 +29,38 @@ ZHWIKI_URL = f"{HF}/datasets/wikimedia/wikipedia/resolve/main/20231101.zh/train-
 TARGET_CHARS = 20_000_000  # 混合后目标字符数（char-level 训练时间可控）
 
 
+def _download(url, out, nbytes=None):
+    """下载并落到 out。
+
+    优先 curl（走系统代理 + CDN，hf-mirror 上比 urllib 稳得多）；机器上没有
+    curl（部分精简 Windows / 容器）时回退 urllib，别让整条语料链路挂掉。
+    """
+    cmd = ["curl", "-sL", "--retry", "3", "--retry-delay", "3", "-A", UA]
+    if nbytes:
+        cmd += ["-r", f"0-{nbytes - 1}"]
+    cmd += ["-o", out, url]
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        print("[download] 未找到 curl，回退 urllib ...", flush=True)
+        headers = {"User-Agent": UA}
+        if nbytes:
+            headers["Range"] = f"bytes=0-{nbytes - 1}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=120) as resp, open(out, "wb") as f:
+            f.write(resp.read())
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise RuntimeError(f"下载失败或为空文件：{url} -> {out}")
+    print(f"fetched {os.path.getsize(out) / 1e6:.1f}MB -> {out}")
+
+
 def fetch_range(url, nbytes, out):
     """Range 截取前 nbytes 字节（curl 走代理+CDN，urllib 会被 hf-mirror 限流）。"""
-    subprocess.run(
-        ["curl", "-sL", "--retry", "3", "--retry-delay", "3", "-A", UA,
-         "-r", f"0-{nbytes - 1}", "-o", out, url],
-        check=True,
-    )
-    print(f"fetched {os.path.getsize(out) / 1e6:.1f}MB -> {out}")
+    _download(url, out, nbytes=nbytes)
 
 
 def fetch_full(url, out):
-    subprocess.run(
-        ["curl", "-sL", "--retry", "3", "--retry-delay", "3", "-A", UA, "-o", out, url],
-        check=True,
-    )
-    print(f"fetched {os.path.getsize(out) / 1e6:.1f}MB -> {out}")
+    _download(url, out)
 
 
 def cjk_ratio(t):

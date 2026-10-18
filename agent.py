@@ -29,6 +29,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -39,7 +40,7 @@ from chat import bigrams, extract_agent_pos
 from corpus_dialog import (BOUND_Q, BYE, BYE_Q, CAN, CAN_Q, FAIL_Q, GREET, GREET_Q,
                            NO, NO_Q, TASK_Q, TASK_READY, THANKS, THANKS_Q,
                            WHO, WHO_Q, YES, YES_Q)
-from env import PointMassEnv
+from env import ACTION_GAIN, DAMPING, PointMassEnv
 from knowledge import ALL_KNOWLEDGE
 from model import MiniWorldModel
 from tinygpt import TinyGPT
@@ -60,6 +61,10 @@ def _iter_kb_entries():
     for group in (SCIENCE_BIG, HISTORY_BIG, TECH_BIG, LIFE_BIG):
         for key, fact in group:
             yield [key], fact
+
+# 期待加载/解析失败的错误类型：显式列出，别用裸 except Exception
+# （裸抓会把 KeyboardInterrupt 之外的编程错误也吞成"降级"，bug 永远不暴露）
+LOAD_ERRORS = (OSError, EOFError, KeyError, ValueError, TypeError, RuntimeError, ImportError)
 
 STATE_TOKEN = "\uE000"
 PROMPT_END = "\n答："
@@ -82,7 +87,9 @@ CONFIG = {
     # ---- MPC 候选策略（借鉴 lingbot-world 的动作条件连续控制思想）----
     "mpc_candidates": "continuous",  # "fixed8"（v1）或 "continuous"（v2）
     "mpc_samples": 16,        # continuous 模式的随机采样数
-    "aim_horizon": 24,        # 想象窗口（实验用，v1 是 12）
+    # 注意：想象窗口只有一个开关 imagine_horizon（上面那行）。
+    # 这里曾有个 aim_horizon，全仓 0 处读取，eval_planner --horizons 写它
+    # 等于写进黑洞——已删除，别再加第二个同名不同义的参数。
     # 状态头推演：比 decode+argmax 快 10 倍，但位置精度差 10 倍
     # （RMSE 0.178 vs 像素 1/64≈0.016）。实测导航 5/8 vs 7/8（同 v3 权重），
     # 所以默认关闭——只有显式传入 use_state_head=True 才走状态头。
@@ -178,6 +185,7 @@ class MiniWorldAgent:
         # ---- 设备统一：世界模型与语言模型同设备（消除 CPU-GPU 跨设备拷贝）----
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dz_scale = 1.0  # Δz 缩放（LM config 会覆盖为训练时的值）
+        self._bpe_mode = False  # _load_lm 命中 BPE 词表时置 True（默认 char）
 
         # ---- 感知层：世界模型 ----
         # 世界模型是 agent 的根基（没有它就没法感知/规划），缺失时给出明确指引
@@ -191,9 +199,11 @@ class MiniWorldAgent:
             raise SystemExit(1)
         self.model = MiniWorldModel(latent_dim=32, action_dim=2)
         try:
-            sd = torch.load(world_ckpt, map_location=self.device)
-        except Exception as e:
-            sys.stderr.write(f"[agent] 世界模型权重加载失败（{world_ckpt}）：{e}\n")
+            # weights_only=True：只反序列化张量与基础类型，切断 pickle 任意代码执行面
+            sd = torch.load(world_ckpt, map_location=self.device, weights_only=True)
+        except LOAD_ERRORS as e:
+            sys.stderr.write(f"[agent] 世界模型权重加载失败（{world_ckpt}）："
+                             f"{type(e).__name__}: {e}\n")
             raise SystemExit(1)
         cur = self.model.state_dict()
         inherited = 0
@@ -246,21 +256,22 @@ class MiniWorldAgent:
         self._lock = threading.Lock()
 
     def _step_env(self, action):
-        """执行一步环境推进，同时记录事件（撞墙检测 / 到达 / 失败）。
+        """执行一步环境推进，同时记录事件（撞墙 / 到达）。
 
-        撞墙判定：环境物理是 v' = 0.8v + 0.12a、pos' = pos + v' * 0.10，
-所以无墙预期位置是 pos + (0.8v + 0.12a) * 0.10；
-实际位置明显偏离时判为撞墙。
-（两次公式错误都踩过：漏 0.8 衰减、漏 0.10 位移系数——
-  结果 36 步误报 21 次撞墙。指标算错就别信）
+        撞墙判定直接读 env 返回的 info["hit_wall"]——边界反弹是环境自己做的，
+        它最清楚碰没碰墙。这里原来复制了一份物理公式去反推"无墙预期位置"，
+        再比偏差 > 0.25：
+          - 公式错一次指标就错一次（历史踩坑：漏 0.8/漏 0.10，36 步误报 21 次）；
+          - 而且正常速度下偏差上限只有 ~0.08（动作增益有界，越界位移就那么大），
+            阈值 0.25 永远不触发 → 撞墙事件实际从未被记录，
+            "你撞墙了吗"永远回答"还没撞过"。
+        现在公式只在 env.py 里存在一份。
         """
-        expected = self.env.pos + (0.8 * self.env.vel + 0.12 * action) * 0.10
         obs, _, done, info = self.env.step(action)
         self.state.total_steps += 1
-        dev = float(np.linalg.norm(self.env.pos - expected))
-        if dev > 0.25:      # 反弹导致位置明显偏离预期
+        if info.get("hit_wall"):
             self.state.add("wall", "撞墙了，反弹回来",
-                            step=self.env.steps)
+                           step=self.env.steps)
         if done and info.get("reached"):
             self.state.add("arrive", f"到达目标了（用了 {self.env.steps} 步）",
                             step=self.env.steps)
@@ -288,7 +299,7 @@ class MiniWorldAgent:
         if not path or not os.path.exists(path):
             return None
         try:
-            ck = torch.load(path, map_location=self.device)
+            ck = torch.load(path, map_location=self.device, weights_only=True)
             c = ck["config"]
             # 词表大小以 head.weight 行数为准（BPE 训练时含特殊 token，
             # 而保存的 stoi 是纯 BPE 词表——两者会差 1，用 head 形状最可靠）
@@ -316,8 +327,12 @@ class MiniWorldAgent:
                     stoi, itos = tok, None
                     self._bpe_mode = True
             return model, stoi, itos, c
-        except Exception as e:
-            sys.stderr.write(f"[agent] LM load failed ({path}: {e})\n")
+        except LOAD_ERRORS as e:
+            # 只吞"权重文件本身有问题"这一类错误；报错必须留痕（之前只写一行
+            # 类型+消息，根因看不到）。这里的失败是设计内的降级路径：
+            # 语言模型缺失/损坏时 agent 仍能以检索+符号层工作。
+            sys.stderr.write(f"[agent] LM load failed ({path}: {type(e).__name__}: {e})\n")
+            sys.stderr.write(traceback.format_exc())
             return None
 
     # ==================== 主入口：统一路由 ====================
@@ -502,7 +517,12 @@ class MiniWorldAgent:
         try:
             answer = self._route(text)
         except Exception as e:
-            sys.stderr.write(f"[agent] reply failed on '{text[:30]}': {e}\n")
+            # 这里是 agent 的对外边界：任何子能力（世界模型/生成/检索）出错
+            # 都不该让整个 agent 崩掉，所以保留兜底；但必须打完整 traceback，
+            # 否则"降级"会变成"掩盖"——出错时至少日志里能看到根因。
+            sys.stderr.write(f"[agent] reply failed on '{text[:30]}': "
+                             f"{type(e).__name__}: {e}\n")
+            sys.stderr.write(traceback.format_exc())
             answer = f"内部出了点问题（{type(e).__name__}），换个问法或说'重置'试试。"
         self._finish(text, answer)
         return answer
@@ -862,7 +882,7 @@ class MiniWorldAgent:
                     n = np.linalg.norm(vec)
                     if n > 1e-6:
                         desired_v = vec / n * min(0.3, n * 1.2)
-                        a_ctrl = (desired_v - 0.8 * self.env.vel) / 0.12
+                        a_ctrl = (desired_v - DAMPING * self.env.vel) / ACTION_GAIN
                         best_a = np.clip(a_ctrl, -0.9, 0.9).astype(np.float32)
                     else:
                         best_a = np.zeros(2, dtype=np.float32)

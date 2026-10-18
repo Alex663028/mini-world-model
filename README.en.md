@@ -69,7 +69,8 @@ PointMassEnv  (64x64 grayscale, 2-D acceleration actions)
           Tool calls: [调用工具 world_act, direction=西北]
 ```
 
-Three interfaces: **CLI / HTTP API / MCP Server**.
+Three interfaces: **CLI / HTTP API / MCP Server** (MCP needs `pip install mcp`; entry point
+`mcp_server.py`; the dependency is declared in `requirements.txt` / `pyproject.toml`).
 
 ---
 
@@ -132,12 +133,25 @@ curl -X POST http://127.0.0.1:8399/task  -d '{"task":"去目标那儿"}'
 curl http://127.0.0.1:8399/state                               # position / events / steps
 ```
 
-**Tests** (30 cases, ~4 s on CPU, no weights needed):
+Security & concurrency: binds `127.0.0.1` by default. To expose it, pass
+`python api_server.py --host 0.0.0.0 --api-key <key>` (or set `MINIWORLD_API_KEY`) —
+otherwise requests get 401. Body limit 64KB (413), non-JSON / non-object bodies get 400
+(no more silent empty-body 200s). The server is a `ThreadingHTTPServer` with a global lock,
+so requests serialize on the single stateful agent (navigation takes tens of seconds).
+
+**Tests** (41 cases, ~3 s on CPU, no weights needed):
 
 ```bash
 pip install pytest
 python -m pytest tests/ -q
 ```
+
+Coverage: physics formulas (constants defined once in `env.py`), boundary bounce and
+wall-hit reporting, triad shapes/open-loop stability, shape-matched weight loading,
+BPE roundtrip and id bounds, **OOV chars are never silently replaced by id 0**,
+empty-corpus training fails loudly, tool-call parsing, bearing convention, event memory,
+system table lookup / retrieval, the dead `imagine_horizon` regression, graceful failure
+without weights. CI runs on Python 3.10/3.12.
 
 **A/B harness** (run this before trusting any single-seed result):
 
@@ -202,7 +216,10 @@ The bottleneck was not the world model but **action granularity** — v1 tried o
 | fixed8 (8 directions) | 9/16 (56%) | 27.1 | 37 s |
 | **continuous** | **16/16 (100%)** | **26.3** | 40 s |
 
-Imagination horizon 20 vs 12: identical (saturated). Kept at 12.
+Imagination horizon 20 vs 12: identical success rate and average steps (16/16, 26.3),
+but horizon 20 costs 67% more planning time (55s vs 33s) — the horizon is not the bottleneck,
+so 12 stays. (This conclusion used to come from the mis-wired `aim_horizon` parameter, i.e. it
+was never actually measured; re-running with the knob fixed reproduces it.)
 
 ### ③ Language model: char 77.5M → BPE 123.4M
 
@@ -236,6 +253,13 @@ After two failed `pip install tokenizers`, we wrote our own (`bpe_tokenizer.py`,
 - 6400 tokens (2053 chars + 4347 merges)
 - **Incremental algorithm** (pair→position index + linked list + heap): 3M chars in **6.5 s** (naive scan: 10+ min)
 - Chunked encoding + pre-encoded cache (`tokenize_corpus.py`)
+- **OOV never pollutes training data**: out-of-vocabulary characters (emoji, rare CJK) are
+  dropped and counted by default; `BPE.encode(text, strict=True)` raises `OOVError` instead.
+  Check a corpus first with `python bpe_tokenizer.py --check --corpus <file>`.
+  (The old code mapped OOV silently to id 0, which is `"\n"` — injecting fake newlines:
+  `encode('你好😀世界𠮷')` decoded back to `"你好\n世界\n"`.)
+- **Empty corpus refuses to train**: missing/too-short corpora exit non-zero instead of
+  silently writing a `vocab 0 + merges 0` vocabulary.
 
 **Vocabulary is domain-dependent (measured, two versions):**
 
@@ -317,7 +341,7 @@ All A/B runs use 16 seeds from identical starting states unless noted.
 | Experiment | Result | Verdict |
 |---|---|---|
 | Continuous action candidates | 9/16 → **16/16** | ✅ action granularity was the real bottleneck |
-| Horizon 20 vs 12 | identical | ➖ saturated, kept 12 |
+| Horizon 20 vs 12 | 16/16 & 26.3 steps both; 55s vs 33s | ➖ saturated, kept 12 (20 only costs 67% more time) |
 | v2 mixed-strategy data | 9/16 → 10/16 | ❌ data is not the bottleneck |
 | v3 state head (navigation) | 12/12 → 8/12 | ❌ 10× less accurate than pixel decode |
 | v3 state head (reconstruction) | MSE 0.0133 → **0.0018** | ✅ clearly better decoder |

@@ -11,6 +11,54 @@ versions follow [Semantic Versioning](https://semver.org/).
 - Keypoint heatmap to replace decode+argmax
 - Learned policy network to replace MPC
 
+### Fixed
+- **P0 — tokenizer OOV pollution**: `BPE.encode` no longer maps out-of-vocabulary characters to
+  id 0 (id 0 is `"\n"`), which silently injected fake newlines into training data
+  (`encode('你好😀世界𠮷')` used to decode back to `"你好\n世界\n"`). OOV characters are now
+  dropped and counted (`oov_total` / `oov_chars` / `oov_rate`); `strict=True` raises `OOVError`.
+  Added `python bpe_tokenizer.py --check --corpus <file>` to audit the drop rate before training,
+  and `tokenize_corpus.py` reports it after encoding.
+- **P0 — dead parameter `aim_horizon`**: `eval_planner.py --horizons` wrote `aim_horizon`, which
+  nothing in the repo ever read, so every "horizon" run silently re-measured horizon=12 and the
+  README's "imagination window is saturated" claim had no valid experiment behind it. It now
+  writes `imagine_horizon`; the parameter is removed from `CONFIG` and the claim was re-measured
+  (16 seeds: horizon 20 → 16/16, 26.3 steps, 55s; horizon 12 → 16/16, 26.3 steps, 33s).
+- **P1 — empty corpus produced an empty vocabulary silently**: `bpe_tokenizer.py --train` now
+  exits non-zero and writes nothing when the corpus is missing or shorter than 200 chars;
+  `train_bpe` / `train_bpe_fast` raise `ValueError` on empty text.
+- **P1 — wall-hit events were never recorded**: `agent._step_env` re-derived the physics formula
+  and used a deviation threshold (>0.25) that normal action gains can never reach (~0.08 max).
+  `PointMassEnv.step` now returns `info["hit_wall"]` and the agent consumes it; the duplicated
+  formula is gone from the agent layer.
+- **P1 — MCP robustness**: the 9 tools catch their own errors and return readable messages
+  (`{"ok": false, "error": ...}` for the dict-returning tool); a missing `mcp` package now prints
+  an install hint instead of an ImportError traceback.
+- **P1 — narrowed exception handling**: `agent._load_lm` only swallows expected load errors and
+  logs a full traceback; `reply()` keeps its boundary catch-all but logs full tracebacks, so a
+  degraded answer no longer hides the root cause.
+- **P2 — HTTP API**: malformed JSON now returns 400 (was a silent empty body + 200), oversized
+  bodies 413, optional `--api-key` / `MINIWORLD_API_KEY` authentication (401), 500 responses log
+  a traceback, and the server is a `ThreadingHTTPServer` guarded by a global lock (requests
+  serialize on the single stateful env; the default bind stays `127.0.0.1`).
+- **P2 — deprecated dead code**: `chat.ChatEngine` is unused (superseded by
+  `agent.MiniWorldAgent`) and now emits a `DeprecationWarning`.
+- **P3 — `torch.load`**: all 16 call sites now pass `weights_only=True` explicitly (verified
+  against every released checkpoint).
+- **P3 — downloads**: `download_corpus.py` falls back to `urllib` when `curl` is unavailable and
+  fails loudly on empty output files.
+- **P3 — `verify_state_bpe.py`**: missing `checkpoint.pt` produces a clear message, and the
+  hit-rate denominator follows `--seeds` instead of a hard-coded `/4`.
+- **P3 — single source for physics constants**: `DAMPING` / `ACTION_GAIN` / `DT` /
+  `WALL_RESTITUTION` / `REACH_DIST` live in `env.py`; the literals copied into the agent and
+  training code are gone.
+- **P3 — packaging/docs**: added `pyproject.toml` (flat-layout `py-modules` list + pytest config);
+  `pyarrow` and `mcp` are declared in `requirements.txt`; README updated for the API security
+  options, the OOV policy and the corrected horizon numbers.
+
+### Changed
+- Unit tests: 30 → 41 (OOV behaviour, empty-corpus rejection, wall/arrival events, system table
+  lookup, knowledge retrieval, dead-parameter regression). Windows-friendly subprocess decoding.
+
 ## [0.1.0] — 2026-10-18
 
 First public release. World model + language model + embodied agent closed loop,

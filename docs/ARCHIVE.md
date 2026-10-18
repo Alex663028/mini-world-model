@@ -160,7 +160,7 @@ conversations 多轮格式、Tool Call 数据、cosine+warmup、梯度裁剪、
 | LingBot-World | 我们的对应 | 今晚的落地 |
 |---|---|---|
 | **Action-conditioned 控制**（act2cam：动作字符串 → 相机运动） | 2 维加速度 | MPC 候选从 8 个固定方向 → **连续采样 + 瞄准方向邻域**（`_mpc_candidates`） |
-| **Fast 版分块增量推理**（KV cache 逐块） | 12 步想象窗口 | 想象窗口可调（`aim_horizon`），实测 20 步的收益 |
+| **Fast 版分块增量推理**（KV cache 逐块） | 12 步想象窗口 | 想象窗口可调（`imagine_horizon`），实测 20 步的收益 |
 | **分钟级长时程一致性** | 12 步 horizon | 暂时够不到；但暴露了我们"规划视野短"的短板 |
 
 `continuous` 候选集（借鉴的核心）：
@@ -184,6 +184,11 @@ conversations 多轮格式、Tool Call 数据、cosine+warmup、梯度裁剪、
 
 想象窗口 20 步 vs 12 步：成功率同为 16/16，步数相同——窗口不是瓶颈，
 保持 12（更快）。
+
+> **更正（代码审核后重测）**：这段实验当时其实不成立——`eval_planner.py --horizons`
+> 写的是 `aim_horizon`，而 agent 全仓只读 `imagine_horizon`，所以"20 步"跑的还是 12 步。
+> 参数修好后重测（16 seed）：horizon 20 = 16/16、26.3 步、55s；horizon 12 = 16/16、
+> 26.3 步、33s。结论不变（窗口饱和、保持 12），但多了一条成本数据：20 步多花 67% 规划时间。
 
 ### 融合点：参数化动作指令（两者的交汇）
 

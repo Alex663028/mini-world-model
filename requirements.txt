@@ -6,3 +6,9 @@ matplotlib>=3.7
 # CPU 版：https://download.pytorch.org/whl/cpu
 # ROCm 版：https://download.pytorch.org/whl/rocm6.2
 torch>=2.2
+
+# 语料下载：download_corpus.py 读 zhwiki parquet 需要（只有下语料时用得到）
+pyarrow>=14.0
+
+# MCP server：python mcp_server.py 需要（可选，不跑 MCP 可以不装）
+mcp>=1.0

@@ -72,7 +72,7 @@ def test_load_v1_weights_by_shape(tmp_path):
     torch.save(v1_like, p)
 
     m = MiniWorldModel(32, 2)
-    sd = torch.load(p, map_location="cpu")
+    sd = torch.load(p, map_location="cpu", weights_only=True)
     cur = m.state_dict()
     loaded = 0
     for k, v in sd.items():

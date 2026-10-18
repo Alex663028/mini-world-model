@@ -15,7 +15,8 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.abspath("."))
+# 代码从脚本所在目录 import；权重按 CWD 找（norm 是权重和脚本同目录跑）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env import PointMassEnv
 from model import MiniWorldModel
 from tinygpt import TinyGPT
@@ -30,7 +31,7 @@ QUESTIONS = [
 
 
 def load_lm(path, device="cuda"):
-    ck = torch.load(path, map_location=device)
+    ck = torch.load(path, map_location=device, weights_only=True)
     c = ck["config"]
     tok_name = c.get("tokenizer", "char")
     if tok_name.endswith(".json"):
@@ -88,7 +89,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     wm = MiniWorldModel(latent_dim=32, action_dim=2)
-    sd = torch.load("checkpoint.pt", map_location="cpu")
+    if not os.path.exists("checkpoint.pt"):
+        raise SystemExit(
+            "[verify] 找不到世界模型权重 checkpoint.pt（按当前目录找）。\n"
+            "         先训练：python train.py --episodes 400 --epochs 20\n"
+            "         或从 Release 下载 checkpoint.pt 放到当前目录。"
+        )
+    sd = torch.load("checkpoint.pt", map_location="cpu", weights_only=True)
     cur = wm.state_dict()   # v1 权重没有 state_head（v3 才加），按形状匹配加载
     for k, v in sd.items():
         if k in cur and cur[k].shape == v.shape:
@@ -96,7 +103,7 @@ def main():
     wm.load_state_dict(cur)
     wm.to(device).eval()
 
-    results = {}
+    results, hit_counts = {}, {}
     for name, path in [("B-BPE104M", args.ckpt),
                        ("A-char75M", "lm_state_motion.pt")]:
         if not os.path.exists(path):
@@ -106,7 +113,7 @@ def main():
         state_id = c.get("state_token_id", 0)
         print(f"\n{'=' * 56}\n{name}（{path}, {c['d_model']}维/{c['n_layers']}层, "
               f"state_dim={c.get('state_dim', 0)}）\n{'=' * 56}")
-        ok = 0
+        ok, used = 0, 0
         for s in range(args.seeds):
             env = PointMassEnv(seed=2026 + s * 977)
             env.reset()
@@ -121,12 +128,17 @@ def main():
                 print(f"  {q[:14]:16s} -> {a[:52]}")
                 if "远" in q and any(f"{true_d:.1f}" in a for _ in [0]):
                     ok += 1
+            used += 1
         results[name] = ok
-        print(f"\n{name} 距离问答命中: {ok}/{args.seeds}")
+        hit_counts[name] = used
+        # 分母用实际跑过的 seed 数：原来写死 /4，--seeds 16 时输出也是 x/4
+        print(f"\n{name} 距离问答命中: {ok}/{used}")
 
     if len(results) == 2:
         print("\n" + "=" * 56)
-        print(f"对比: A-char75M {results['A-char75M']}/4  vs  B-BPE104M {results['B-BPE104M']}/4")
+        a, b = "A-char75M", "B-BPE104M"
+        print(f"对比: {a} {results[a]}/{hit_counts[a]}  vs  "
+              f"{b} {results[b]}/{hit_counts[b]}")
 
 
 if __name__ == "__main__":

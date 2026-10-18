@@ -148,7 +148,7 @@ def main():
     tok = load_tokenizer(args.bpe) if args.bpe else None
     stoi = tok.bpe.vocab if tok is not None else None
 
-    ck = torch.load(args.resume, map_location="cpu")
+    ck = torch.load(args.resume, map_location="cpu", weights_only=True)
     ck_stoi, ck_itos, state = ck["stoi"], ck["itos"], ck["model"]
     base_cfg = ck["config"]
 

@@ -42,9 +42,20 @@ def main():
         if (i // step) % 4 == 0:
             print(f"  {i / len(text) * 100:.0f}% ({time.time() - t0:.0f}s)", flush=True)
     arr = np.array(ids, dtype=np.int32)
+    if arr.size == 0:
+        sys.exit("[tokenize] 编码结果为空：语料为空，或所有字符都在 BPE 词表之外")
     np.save(args.out, arr)
     print(f"done: {len(ids)} tokens ({len(text) / len(ids):.2f} 字符/token), "
           f"{time.time() - t0:.0f}s -> {args.out}")
+    # OOV 丢弃率必须显式报出来：词表外字符现在被丢弃（以前会静默变成 id 0 =
+    # "\n"，污染训练数据），丢弃率高说明语料/词表不匹配，得先处理
+    if getattr(tok, "oov_total", 0):
+        top = sorted(tok.oov_chars.items(), key=lambda kv: -kv[1])[:10]
+        shown = "、".join(f"{c!a}×{n}" for c, n in top)
+        print(f"[warn] OOV 丢弃 {tok.oov_total} 字符（{tok.oov_rate * 100:.4f}%），"
+              f"高频：{shown}")
+    else:
+        print("OOV: 0（语料全部落在词表覆盖范围内）")
 
 
 if __name__ == "__main__":

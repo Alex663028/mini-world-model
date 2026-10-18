@@ -10,6 +10,15 @@
 
 import numpy as np
 
+# ---- 物理常量（唯一定义处）----
+# agent._step_env 的撞墙预测公式、chat/控制层都从这里取；
+# 之前字面量散落在 agent.py，改一处漏一处会让"撞墙检测"悄悄算错。
+DAMPING = 0.80          # 速度每步衰减系数
+ACTION_GAIN = 0.12      # 动作到加速度的增益
+DT = 0.10               # 位置积分步长
+WALL_RESTITUTION = 0.5  # 撞墙速度衰减
+REACH_DIST = 0.06       # 判定到达的距离阈值
+
 
 class PointMassEnv:
     """点质量导航环境：控制一个小球到达随机目标点。"""
@@ -64,16 +73,21 @@ class PointMassEnv:
         # 阻尼匀加速（动作效应刻意调大：每步位移 ~0.06，是初版的 2.5 倍。
         # 位移太小的话动作信号相对潜状态尺度太弱，dynamics 会学成
         # "忽略动作"的恒等映射——实测过，8 个候选方向想象终点全挤在一起）
-        self.vel = self.vel * 0.80 + action * 0.12
-        self.pos = self.pos + self.vel * 0.10
-        # 边界反弹（能量衰减）
+        self.vel = self.vel * DAMPING + action * ACTION_GAIN
+        self.pos = self.pos + self.vel * DT
+        # 边界反弹（能量衰减）。hit_wall 由环境自己上报：
+        # agent 层不用再"猜"有没有撞墙（以前靠复制物理公式反推，
+        # 公式错一次指标就错一次，而且正常速度下阈值根本触发不了）。
+        hit_wall = False
         for i in range(2):
             if self.pos[i] > 1.0:
                 self.pos[i] = 1.0
-                self.vel[i] *= -0.5
+                self.vel[i] *= -WALL_RESTITUTION
+                hit_wall = True
             elif self.pos[i] < -1.0:
                 self.pos[i] = -1.0
-                self.vel[i] *= -0.5
+                self.vel[i] *= -WALL_RESTITUTION
+                hit_wall = True
         self.trail.append(self.pos.copy())
         if len(self.trail) > self.trail_len:
             self.trail.pop(0)
@@ -81,8 +95,8 @@ class PointMassEnv:
 
         dist = float(np.linalg.norm(self.pos - self.target))
         reward = -dist
-        done = dist < 0.06 or self.steps >= self.max_steps
-        info = {"dist": dist, "reached": dist < 0.06}
+        done = dist < REACH_DIST or self.steps >= self.max_steps
+        info = {"dist": dist, "reached": dist < REACH_DIST, "hit_wall": hit_wall}
         return self._obs(), reward, done, info
 
     def _obs(self):

@@ -36,7 +36,7 @@ IMG_SIZE = 64
 def load_model(ckpt_path):
     """按形状匹配加载：v1/v2 权重没有 state_head（v3 才加），不能严格 load。"""
     model = MiniWorldModel(latent_dim=LATENT_DIM, action_dim=2)
-    sd = torch.load(ckpt_path, map_location="cpu")
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     cur = model.state_dict()
     for k, v in sd.items():
         if k in cur and cur[k].shape == v.shape:

@@ -73,7 +73,7 @@ def main():
     # 踩坑：重建词表会让续训语料的词表覆盖 checkpoint 的词表，
     # embedding/head 因形状变化全废（参数 75.5M→69.6M，loss 2→6 爆炸）
     if args.vocab_from and os.path.exists(args.vocab_from):
-        ck_v = torch.load(args.vocab_from, map_location="cpu")
+        ck_v = torch.load(args.vocab_from, map_location="cpu", weights_only=True)
         stoi = dict(ck_v["stoi"])
         itos = dict(ck_v["itos"])
         added = 0
@@ -109,7 +109,7 @@ def main():
 
     # 断点续训：按形状匹配加载（词表变化时 embedding 保持新初始化，其余层继承）
     if args.resume and os.path.exists(args.resume):
-        ck = torch.load(args.resume, map_location="cpu")
+        ck = torch.load(args.resume, map_location="cpu", weights_only=True)
         old_state = ck["model"]
         new_state = model.state_dict()
         matched = {

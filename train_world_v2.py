@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from chat import extract_agent_pos
-from env import PointMassEnv
+from env import ACTION_GAIN, DAMPING, PointMassEnv
 from model import MiniWorldModel, count_params
 
 
@@ -61,7 +61,7 @@ def pd_action(env):
     if n < 1e-6:
         return np.zeros(2, dtype=np.float32)
     desired_v = vec / n * min(0.3, n * 1.2)
-    a = (desired_v - 0.8 * env.vel) / 0.12
+    a = (desired_v - DAMPING * env.vel) / ACTION_GAIN
     return np.clip(a, -0.9, 0.9).astype(np.float32)
 
 
@@ -136,7 +136,7 @@ def main():
     # 模型（结构不变，保证 checkpoint 兼容）
     model = MiniWorldModel(latent_dim=32, action_dim=2).to(device)
     if os.path.exists(args.resume):
-        sd = torch.load(args.resume, map_location=device)
+        sd = torch.load(args.resume, map_location=device, weights_only=True)
         if sd.keys() == model.state_dict().keys() and all(
                 sd[k].shape == model.state_dict()[k].shape for k in sd):
             model.load_state_dict(sd)

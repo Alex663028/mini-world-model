@@ -1,12 +1,13 @@
-"""环境测试：物理公式、边界反弹、到达判定。
+"""环境测试：物理公式、边界反弹、到达判定、撞墙上报。
 
-这些断言直接对应 agent.py 里撞墙检测的公式——公式错了，
-事件记忆就会误报（实测踩过：36 步误报 24 次撞墙）。
+这些断言直接对应 agent.py 的事件记忆——物理公式或撞墙标志错了，
+"你撞墙了吗"就会撒谎（实测踩过：36 步误报 24 次撞墙；
+又反向踩过：反推公式的阈值永远不触发，撞墙事件一条都记不到）。
 """
 
 import numpy as np
 
-from env import PointMassEnv, random_policy
+from env import ACTION_GAIN, DAMPING, REACH_DIST, PointMassEnv, random_policy
 
 
 def test_reset_shapes():
@@ -33,7 +34,7 @@ def test_physics_formula():
     env.vel = np.zeros(2, dtype=np.float32)
     a = np.array([0.5, -0.25], dtype=np.float32)
 
-    v_expect = 0.8 * np.zeros(2) + 0.12 * a
+    v_expect = DAMPING * np.zeros(2) + ACTION_GAIN * a
     pos_expect = np.zeros(2) + v_expect * 0.10
 
     env.step(a)
@@ -59,6 +60,7 @@ def test_reach_and_timeout():
     env.target = env.pos.copy()
     _, _, done, info = env.step(np.zeros(2, dtype=np.float32))
     assert done and info["reached"], "目标重合时应判定到达"
+    assert not info["hit_wall"], "中间位置不应报撞墙"
 
     env2 = PointMassEnv(seed=2, max_steps=3)
     env2.reset()
@@ -66,6 +68,31 @@ def test_reach_and_timeout():
     for _ in range(3):
         _, _, done, info = env2.step(np.zeros(2, dtype=np.float32))
     assert done and not info["reached"], "超时应终止但不算到达"
+
+
+def test_hit_wall_flag_reported_by_env():
+    """撞墙必须由环境上报（agent 的事件记忆只读这个标志）。
+
+    回归：agent 曾用"复制物理公式反推 + 偏差阈值 0.25"来判撞墙，
+    而正常动作增益下偏差上限只有 ~0.08，导致撞墙事件一条都记不到。
+    """
+    env = PointMassEnv(seed=7)
+    env.reset()
+    env.pos = np.array([0.99, 0.0], dtype=np.float32)
+    env.vel = np.zeros(2, dtype=np.float32)
+    hit = False
+    for _ in range(10):
+        _, _, _, info = env.step(np.array([1.0, 0.0], dtype=np.float32))
+        hit = hit or info["hit_wall"]
+    assert hit, "持续朝墙推必须上报 hit_wall"
+
+    env2 = PointMassEnv(seed=8)
+    env2.reset()
+    env2.pos = np.zeros(2, dtype=np.float32)
+    env2.vel = np.zeros(2, dtype=np.float32)
+    _, _, _, info2 = env2.step(np.zeros(2, dtype=np.float32))
+    assert info2["hit_wall"] is False, "场地中央不能误报撞墙"
+    assert REACH_DIST == 0.06, "到达阈值改动需同步 README 数值"
 
 
 def test_random_policy_range():

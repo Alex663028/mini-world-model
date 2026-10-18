@@ -108,7 +108,7 @@ if __name__ == "__main__":
     if args.vocab_from:
         import torch
 
-        ck = torch.load(args.vocab_from, map_location="cpu")
+        ck = torch.load(args.vocab_from, map_location="cpu", weights_only=True)
         allowed = set(ck["stoi"].keys())
         before = len(corpus)
         corpus = "".join(c for c in corpus if c in allowed)

@@ -84,7 +84,7 @@ def main():
 
     # warm start：老 checkpoint 没有 state_head，按形状匹配加载
     if os.path.exists(args.resume):
-        sd = torch.load(args.resume, map_location=device)
+        sd = torch.load(args.resume, map_location=device, weights_only=True)
         cur = model.state_dict()
         loaded = 0
         for k, v in sd.items():
